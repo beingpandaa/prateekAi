@@ -34,6 +34,14 @@ Backend regression results: **409 passed, 0 failed**. Configuration results: **5
 
 The 0.6.1 portable folder was built and its Windows product/version metadata verified. **Packaged launch check: BLOCKED** by a Windows Application Control policy on the local test PC. The executable is unsigned. No security setting was changed and the launch block was not bypassed. The earlier 0.6.0 packaged pass does not establish that 0.6.1 can launch; distribution signing/trust remains unresolved. The source-driven UI and cross-layer results above do not replace this packaged launch gate.
 
+## Follow-up source validation — 0.6.2 (2026-10-01)
+
+Offline regressions reproduce and address four audio-state failures: late interims reopening finalized audio, empty final Results not clearing retracted words, partial finals dropping trailing constraints, and repeated questions bypassing tail protection after an incomplete-audio recovery. Coverage includes both 800/6500 ms and 700/3000 ms pause/unfinished settings, consecutive questions, session restart, malformed timestamps, and float32 timestamp rounding. Diagnostics distinguish manual mode from missing final audio and retain the decision-time settings needed for the next live investigation.
+
+The backend suite passed **449 tests, 0 failed**. The production cross-layer suite passed **58 checks**, using 19 mocked answer requests and 3 fake speech connections, with zero real cloud requests or hardware audio capture. New wire-level cases pass partial Results and UtteranceEnd through the actual SpeechSession parser and verify the complete constraint reaches the answer request. Council review also replayed recovery against retained expired content and confirmed no stale or duplicate submission. These are deterministic source tests, not evidence of real ASR accuracy or live model quality.
+
+Version 0.6.2 identifies this source revision; it has not been packaged or installed for live use. The earlier 0.6.1 Windows Application Control launch block remains unresolved. Existing portable folders do not contain these newer source changes. Live acceptance and distribution trust remain open gates.
+
 ## Run record template
 
 Copy one record per case/configuration/repetition into a private local test record. Commit only a reviewed, redacted summary; never commit keys, candidate profiles, recordings, or raw diagnostics.

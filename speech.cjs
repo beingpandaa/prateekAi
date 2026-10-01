@@ -163,21 +163,22 @@ class SpeechSession {
     }
     if (message.type === 'Results') {
       const text = message.channel?.alternatives?.[0]?.transcript;
-      if (typeof text !== 'string' || (!text.trim() && !message.speech_final)) return;
+      if (typeof text !== 'string' || (!text.trim() && !message.speech_final && !message.is_final)) return;
       this._onTranscript({
+        eventType: 'Results', fromFinalize: message.from_finalize === true,
         source: this.source, text, isFinal: message.is_final === true, speechFinal: message.speech_final === true,
-        start: offset + (Number.isFinite(message.start) ? message.start : 0),
+        start: Number.isFinite(message.start) && message.start >= 0 ? offset + message.start : null,
         duration: Number.isFinite(message.duration) ? message.duration : 0
       });
     } else if (message.type === 'SpeechStarted') {
       // Resume the local turn before the next transcript result arrives.
       // https://developers.deepgram.com/docs/speech-started
-      this._onTranscript({ source: this.source, text: '', isFinal: false, speechFinal: false, speechStarted: true,
-        start: offset + (Number.isFinite(message.timestamp) ? message.timestamp : 0), duration: 0 });
+      this._onTranscript({ eventType: 'SpeechStarted', source: this.source, text: '', isFinal: false, speechFinal: false, speechStarted: true,
+        start: Number.isFinite(message.timestamp) && message.timestamp >= 0 ? offset + message.timestamp : null, duration: 0 });
     } else if (message.type === 'UtteranceEnd') {
       // An empty turn marker, never a duplicate of the previously final text.
-      this._onTranscript({ source: this.source, text: '', isFinal: true, speechFinal: true,
-        start: offset + (Number.isFinite(message.last_word_end) ? message.last_word_end : 0), duration: 0 });
+      this._onTranscript({ eventType: 'UtteranceEnd', source: this.source, text: '', isFinal: true, speechFinal: true,
+        start: Number.isFinite(message.last_word_end) && message.last_word_end >= 0 ? offset + message.last_word_end : null, duration: 0 });
     }
   }
 

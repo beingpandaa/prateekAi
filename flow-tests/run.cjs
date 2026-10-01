@@ -475,6 +475,24 @@ async function finish(error) {
   remote.transcript('What is binary search?', 19);
   await until(() => requests.length === recoveryOffset + 2 && contentUI("document.getElementById('currentQuestion').textContent==='What is binary search?' && document.getElementById('answerScroll').getAttribute('aria-busy')==='false'"), 'complete next question survives orphan VAD in production flow');
   check('A stray SpeechStarted event cannot block the next automatic answer', requests.at(-1).question === 'What is binary search?');
+  const intervalRequestOffset = requests.length;
+  const wireResult = (text, start, duration, isFinal) => remote.emit('message', Buffer.from(JSON.stringify({
+    type:'Results',is_final:isFinal,speech_final:false,start,duration,channel:{alternatives:[{transcript:text}]}
+  })));
+  wireResult('Find the longest sum-K subarray. The array includes negative numbers and zeros.',22,5,false);
+  wireResult('Find the longest sum-K subarray.',22,2,true);
+  remote.emit('message',Buffer.from(JSON.stringify({type:'UtteranceEnd',last_word_end:24})));
+  await delay(1100);
+  check('Partial provider finals and UtteranceEnd cannot submit a question before its constraint',requests.length===intervalRequestOffset);
+  wireResult('The array includes negative numbers and zeros.',24,3,true);
+  await until(()=>requests.length===intervalRequestOffset+1 && contentUI("document.getElementById('answerScroll').getAttribute('aria-busy')==='false'"),'final constraint completes the full question');
+  check('SpeechSession, turn assembly and provider request retain the complete negative-number constraint',requests.at(-1).question==='Find the longest sum-K subarray. The array includes negative numbers and zeros.');
+  wireResult('Find the longest sum-K subarray.',22,2,false);
+  wireResult('What is a closure?',29,2,true);
+  wireResult('um',31,0.4,false);
+  wireResult('',31,1,true);
+  await until(()=>requests.length===intervalRequestOffset+2 && contentUI("document.getElementById('currentQuestion').textContent==='What is a closure?' && document.getElementById('answerScroll').getAttribute('aria-busy')==='false'"),'empty final clears retracted interim words');
+  check('Late finalized audio and an empty final Results packet do not block the next automatic question',requests.at(-1).question==='What is a closure?');
   await contentClick('closeContent');
   await until(() => remote.closedByClient && microphone.closedByClient && ui("document.getElementById('listen').textContent==='Start listening'"), 'closing voice fallback stops both speech streams');
   check('Closing the popup ends both paid-stream equivalents and all synthetic capture resources', await ui(`flowCapture.closed===${captureBeforeVoice.closed + 1} && flowCapture.tracks.every(track=>track.stopped) && flowCapture.ports.every(port=>port.closed)`));

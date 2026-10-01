@@ -105,6 +105,7 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
       transcript(text, extra = {}) { this.options.onTranscript({ source: this.options.source, text, isFinal: true, speechFinal: true, ...extra }); }
     } },
     './turns.cjs': require('./turns.cjs'),
+    './audio-finality.cjs': require('./audio-finality.cjs'),
     './voice-fallback.cjs': require('./voice-fallback.cjs'),
     './profile.cjs': require('./profile.cjs'),
     './routing.cjs': require('./routing.cjs'),
@@ -1545,6 +1546,7 @@ test('unresolved text recovery also works with Auto off and an explicit keyboard
   const h = harness(t); await h.start('practice', false); const mic = h.connection('you');
   mic.transcript('An unfinished constraint', {isFinal:false,start:0,duration:1});
   mic.transcript('What is binary search?', {start:3,duration:2}); await h.tick(1000);
+  assert.equal(h.requests.length,0); await h.tick(5501);
   assert.equal(h.invoke('content:state').questionStatus.canSubmit, false);
   assert.equal((await h.invoke('answer:submit-pending')).ok, false);
   mic.transcript('What is binary search?', {start:7,duration:2}); await h.tick(1000);
@@ -1590,7 +1592,110 @@ test('expiry: newer unrelated final must not silently discard an unresolved text
   assert.equal(h.requests.length, 1, 'Missing ASR text needs an explicit incomplete outcome, unlike a VAD-only hint');
   const pending = h.invoke('answer:submit-pending'); await settle(); await h.tick(1500);
   assert.equal((await pending).ok, false); assert.equal(h.requests.length, 1);
+  await h.tick(4001);
   mic.transcript('What is binary search?', {start:8,duration:2}); await h.tick(1000);
   assert.equal(h.requests.length, 2, 'Repeating the full question after the incomplete outcome must recover');
   assert.equal(h.requests[1].options.question, 'What is binary search?');
 });
+
+for (const [pause, unfinished] of [[800, 6500], [700, 3000]]) {
+  test(`call questions after leading VAD submit at ${pause}/${unfinished}ms settings and survive a restart`, async t => {
+    const h = harness(t);
+    h.invoke('settings:save', { autoAnswer: true, questionPauseMs: pause, incompletePauseMs: unfinished, answerTimeoutMs: 70000 });
+    await h.start('call', true);
+    const remote = h.connection('remote');
+    const questions = ['Please explain disclosures in JavaScript.', 'Can you please explain your professional background?', 'Can you explain your professional background?'];
+    for (const [index, question] of questions.entries()) {
+      const start = 3 + index * 12;
+      remote.transcript('', {isFinal:false,speechFinal:false,speechStarted:true,start:start-0.2,duration:0});
+      remote.transcript(question, {start,duration:3.3});
+      await h.tick(pause-1); assert.equal(h.requests.length,index);
+      await h.tick(1); assert.equal(h.requests.length,index+1);
+      assert.equal(h.requests[index].options.question,question);
+    }
+    h.invoke('listen:stop'); await h.start('call', true);
+    const restarted = h.connection('remote');
+    restarted.transcript('', {isFinal:false,speechFinal:false,speechStarted:true,start:2.8,duration:0});
+    restarted.transcript('Please explain closures in JavaScript.', {start:3.02,duration:3.27});
+    await h.tick(pause);
+    assert.equal(h.requests.length,4);
+    assert.equal(h.requests[3].options.question,'Please explain closures in JavaScript.');
+    const events = h.invoke('diagnostics:get').events;
+    const start = events.findLast(event=>event.kind==='session-start');
+    assert.equal(start.autoAnswer,true); assert.equal(start.questionPauseMs,pause); assert.equal(start.incompletePauseMs,unfinished);
+    assert.equal(start.questionSource,'remote'); assert.equal(start.answerTimeoutMs,70000);
+    assert.equal(events.some(event=>event.kind==='question-decision'&&event.reason==='manual-mode'),false);
+  });
+}
+
+test('diagnostics distinguish disabled Auto-answer from an unresolved text-bearing audio guard', async t => {
+  const h = harness(t); await h.start('practice',false); const mic=h.connection('you');
+  mic.transcript('What is a closure?',{start:0,duration:1}); await h.tick(800);
+  let events=h.invoke('diagnostics:get').events;
+  assert.equal(events.findLast(event=>event.kind==='question-decision').reason,'manual-mode');
+  h.invoke('session:preferences',{autoAnswer:true});
+  mic.transcript('A missing constraint',{isFinal:false,start:2,duration:1});
+  mic.transcript('Describe closures in JavaScript.',{start:4,duration:2}); await h.tick(800);
+  assert.equal(h.requests.length,0); await h.tick(5701);
+  events=h.invoke('diagnostics:get').events;
+  const blocked=events.findLast(event=>event.kind==='question-decision'&&event.awaitingFinalAudio);
+  assert.equal(blocked.reason,'incomplete-audio'); assert.equal(blocked.autoAnswer,true);
+  assert.deepEqual(JSON.parse(JSON.stringify(blocked.pendingAudioSpans)),[{start:2,end:3,hasText:true}]);
+  assert.equal(h.requests.length,0);
+  const progress=events.filter(event=>event.kind==='speech-progress');
+  assert.ok(progress.length>0);
+  assert.equal(progress.some(event=>Object.hasOwn(event,'text')),false,'Interim speech words are not duplicated into progress diagnostics');
+});
+
+for (const [pause,unfinished] of [[800,6500],[700,3000]]) {
+  test(`finalized audio handles stale interims and retracted words without blocking later questions (${pause}/${unfinished})`, async t => {
+    const h=harness(t); h.invoke('settings:save',{autoAnswer:true,questionPauseMs:pause,incompletePauseMs:unfinished}); await h.start('call');
+    const remote=h.connection('remote');
+    remote.transcript('What is a closure?',{start:0,duration:2}); await h.tick(pause);
+    assert.equal(h.requests.length,1);
+    remote.transcript('What is a closure?',{isFinal:false,start:0,duration:2});
+    remote.transcript('Describe closures in JavaScript.',{start:4,duration:2}); await h.tick(200);
+    remote.transcript('Describe closures in JavaScript.',{isFinal:false,start:4,duration:2}); await h.tick(pause-200);
+    assert.equal(h.requests.length,2,'A late interim within a finalized range must not re-open it');
+    remote.transcript('What is binary search?',{start:8,duration:2}); await h.tick(200);
+    remote.transcript('um',{isFinal:false,start:10,duration:0.4});
+    remote.transcript('',{eventType:'Results',isFinal:true,speechFinal:false,start:10,duration:1});
+    await h.tick(pause);
+    assert.equal(h.requests.length,3,'An explicitly finalized empty range settles retracted interim text');
+    assert.equal(h.requests[2].options.question,'What is binary search?');
+  });
+  test(`partial final preserves trailing constraints until their own final result (${pause}/${unfinished})`, async t => {
+    const h=harness(t); h.invoke('settings:save',{autoAnswer:true,questionPauseMs:pause,incompletePauseMs:unfinished}); await h.start('call');
+    const remote=h.connection('remote');
+    remote.transcript('Find the longest sum-K subarray. The array includes negative values and zeros.',{isFinal:false,start:4,duration:5});
+    remote.transcript('Find the longest sum-K subarray.',{isFinal:true,speechFinal:false,start:4,duration:2}); await h.tick(pause+100);
+    assert.equal(h.requests.length,0,'Partial final must not drop the constraint already present in the interim tail');
+    remote.transcript('',{eventType:'UtteranceEnd',start:6,duration:0}); await h.tick(100);
+    assert.equal(h.requests.length,0,'UtteranceEnd cannot finalize that tail');
+    remote.transcript('The array includes negative values and zeros.',{isFinal:true,speechFinal:true,start:6,duration:3}); await h.tick(pause);
+    assert.equal(h.requests.length,1);
+    assert.equal(h.requests[0].options.question,'Find the longest sum-K subarray. The array includes negative values and zeros.');
+  });
+  test(`unrelated empty final cannot discard an uncaptured constraint (${pause}/${unfinished})`, async t => {
+    const h=harness(t); h.invoke('settings:save',{autoAnswer:true,questionPauseMs:pause,incompletePauseMs:unfinished}); await h.start('call');
+    const remote=h.connection('remote');
+    remote.transcript('Find the longest sum-K subarray.',{start:4,duration:2});
+    remote.transcript('The array includes negative values',{isFinal:false,start:6,duration:3});
+    remote.transcript('',{eventType:'Results',start:10,duration:2});
+    await h.tick(unfinished+1);
+    assert.equal(h.requests.length,0); assert.equal(h.invoke('content:state').questionStatus.canSubmit,false);
+  });
+  test(`repeating a question after missing audio retains its unfinished constraint (${pause}/${unfinished})`, async t => {
+    const h=harness(t); h.invoke('settings:save',{autoAnswer:true,questionPauseMs:pause,incompletePauseMs:unfinished}); await h.start('call');
+    const remote=h.connection('remote');
+    remote.transcript('An unfinished constraint',{isFinal:false,start:0,duration:2}); await h.tick(unfinished+1);
+    remote.transcript('Return its length.',{start:3,duration:1}); await h.tick(pause);
+    assert.equal(h.requests.length,0,'A dependent continuation cannot reconstruct the missing question');
+    remote.transcript('Find the longest sum-K subarray. The array includes negative values and zeros.',{isFinal:false,start:5,duration:5});
+    remote.transcript('Find the longest sum-K subarray.',{isFinal:true,speechFinal:false,start:5,duration:2}); await h.tick(pause+100);
+    assert.equal(h.requests.length,0,'The repeated question must retain the coverage of its interim tail');
+    remote.transcript('The array includes negative values and zeros.',{start:7,duration:3}); await h.tick(pause);
+    assert.equal(h.requests.length,1);
+    assert.equal(h.requests[0].options.question,'Find the longest sum-K subarray. The array includes negative values and zeros.');
+  });
+}

@@ -6,6 +6,7 @@ const { pathToFileURL } = require('node:url');
 const { streamProviderAnswer, listProviderModels, validateBaseUrl } = require('./provider-adapters.cjs');
 const { SpeechSession } = require('./speech.cjs');
 const { TurnAssembler, looksLikeQuestion, classifyTurn, isFreshQuestionStart } = require('./turns.cjs');
+const { AudioFinality } = require('./audio-finality.cjs');
 const { DEFAULT_VOICE_PHRASES, normalizeVoicePhrases, detectVoiceCommand, VoiceCommandMatcher, PendingQuestionBuffer } = require('./voice-fallback.cjs');
 const { resolveProfileDirectory, createProfileStore } = require('./profile.cjs');
 const { selectRoute } = require('./routing.cjs');
@@ -40,6 +41,7 @@ let pendingBuffer = null, micCommands = null, micCommandTimer = null, lastVoiceA
 let answerQueue = [], voiceCommandStatus = null, pendingSubmission = null, providerBlockedMessage = '';
 const sourceNeedsFresh = new Set();
 const audioUnfinished = new Map(), finalWaiters = new Set(), diagnosticsEvents = [];
+const audioFinality = new Map();
 const submittedQuestions = new Map();
 const answeredTurns = new Set();
 const recentAcceptedQuestions = new Map();
@@ -249,6 +251,18 @@ function recordDiagnostic(kind, message, detail = {}) {
   if (diagnosticsEvents.length > 400) diagnosticsEvents.shift();
   send('diagnostic', { entry });
 }
+function diagnosticSessionSettings() {
+  return { appVersion: app.getVersion?.() || 'development', sessionMode: activeSessionMode,
+    questionSource, autoAnswer: settings.autoAnswer, questionPauseMs: settings.questionPauseMs,
+    incompletePauseMs: settings.incompletePauseMs, answerTimeoutMs: settings.answerTimeoutMs,
+    maxAutoAnswers: settings.maxAutoAnswers, speechLanguage: settings.speechLanguage,
+    voiceFallbackEnabled: settings.voiceFallbackEnabled, includeMicContext };
+}
+function diagnosticAudioState(source) {
+  const spans = audioUnfinished.get(source)?.spans || [];
+  return { awaitingFinalAudio: spans.length > 0,
+    pendingAudioSpans: spans.map(span => ({ start: span.start, end: span.end, hasText: span.hasText })) };
+}
 function reportVoice(status, message, detail = {}) {
   voiceCommandStatus = { status, message, at: Date.now(), ...detail };
   send('voice-command-status', voiceCommandStatus);
@@ -269,10 +283,11 @@ function resetTurns() {
   answeredTurns.clear(); recentAcceptedQuestions.clear(); submittedQuestions.clear();
   pendingBuffer = null; micCommands?.reset(); micCommands = null;
   clearTimeout(micCommandTimer); micCommandTimer = null; lastVoiceAt = -Infinity;
-  audioUnfinished.clear(); sourceNeedsFresh.clear(); providerBlockedMessage = ''; for (const notify of [...finalWaiters]) notify(false); finalWaiters.clear();
+  audioUnfinished.clear(); audioFinality.clear(); sourceNeedsFresh.clear(); providerBlockedMessage = ''; for (const notify of [...finalWaiters]) notify(false); finalWaiters.clear();
   pendingSubmission = null; voiceCommandStatus = null;
 }
 function stopSession(reason = 'Listening stopped.') {
+  if (live) recordDiagnostic('session-stop', reason);
   resetTurns(); cancelAnswer(); live = false; captureAllowed = false; sessionId++;
   clearTimeout(sessionTimer); sessionTimer = null;
   for (const connection of speech.values()) connection.stop();
@@ -403,7 +418,11 @@ function beginTurns(id) {
     onTurn: turn => {
       if (!live || sessionId !== id) return;
       if (turn.reason === 'incomplete-audio') {
+        if (turn.hadInterimText) recordDiagnostic('question-decision', 'Speech text did not finalize within the unfinished phrase window.', {
+          decision: 'incomplete', reason: 'incomplete-audio', source: turn.source, questionId: turn.id,
+          autoAnswer: settings.autoAnswer, ...diagnosticAudioState(turn.source) });
         audioUnfinished.delete(turn.source);
+        audioFinality.get(turn.source)?.clearPending();
         if (!turn.text) {
           if (turn.hadInterimText) markAudioGap(turn.source, 'incomplete-audio');
           recordDiagnostic('question-decision', turn.hadInterimText ? 'Speech text never finalized; repeat the full question.' : 'Expired speech-start without transcript words.', { decision: turn.hadInterimText ? 'incomplete' : 'ignored', source: turn.source, reason: turn.hadInterimText ? 'incomplete-audio' : 'empty-speech-start' });
@@ -416,7 +435,7 @@ function beginTurns(id) {
       send('question-preview', { text: '', turnId: turn.id, pending: false });
       const snapshot = pendingBuffer.snapshot();
       if (audioUnfinished.has(questionSource)) {
-        recordDiagnostic('question-decision', 'Unresolved speech text: repeat the full question.', { decision: 'incomplete', reason: 'incomplete-audio', questionId: snapshot.id });
+        recordDiagnostic('question-decision', 'Unresolved speech text: repeat the full question.', { decision: 'incomplete', reason: 'incomplete-audio', questionId: snapshot.id, autoAnswer: settings.autoAnswer, ...diagnosticAudioState(questionSource) });
         markAudioGap(questionSource, 'incomplete-audio');
         return;
       }
@@ -430,28 +449,21 @@ function beginTurns(id) {
       if (settings.autoAnswer) {
         const result = queueSnapshot(snapshot, 'auto');
         if (!result.ok) { recordDiagnostic('question-decision', result.message, { decision: 'blocked', trigger: 'auto' }); reportHeldQuestion(snapshot, 'submission-blocked', result.message); send('notice', { message: result.message }); }
-      } else { lastQuestion = snapshot.text; send('question', { text: snapshot.text, turnId: snapshot.id, source: questionSource }); lastQuestionTiming = { question: snapshot.text, readyAt: Date.now() }; recordDiagnostic('question-decision', 'Pending question ready', { decision: 'ready', questionId: snapshot.id }); }
+      } else { lastQuestion = snapshot.text; send('question', { text: snapshot.text, turnId: snapshot.id, source: questionSource }); lastQuestionTiming = { question: snapshot.text, readyAt: Date.now() }; recordDiagnostic('question-decision', 'Question ready; Auto-answer is off', { decision: 'ready', reason: 'manual-mode', autoAnswer: false, questionId: snapshot.id }); }
     } });
 }
 function trackFinalState(result) {
-  let spans = audioUnfinished.get(result.source)?.spans || [];
-  if (result.speechStarted || (!result.isFinal && result.text)) {
-    const start = Number.isFinite(result.start) ? result.start : null;
-    const existing = spans.find(span => span.start === start);
-    if (existing) existing.hasText ||= !!result.text;
-    else spans.push({ start, hasText: !!result.text });
-    if (spans.length > 32) { markAudioGap(result.source, 'incomplete-audio'); return; }
-  } else if (result.isFinal && result.text) {
-    const end = Number.isFinite(result.start) ? result.start + (result.duration || 0) : null;
-    spans = spans.filter(span => span.start !== null && end !== null
-      && !(!span.hasText && end > span.start + 0.001)
-      && !(result.start <= span.start + 0.02 && end > span.start + 0.001));
-  }
+  let tracker = audioFinality.get(result.source);
+  if (!tracker) { tracker = new AudioFinality(); audioFinality.set(result.source, tracker); }
+  const outcome = tracker.push(result), spans = outcome.pending;
+  if (outcome.overflow) { markAudioGap(result.source, 'incomplete-audio'); return { ...outcome, ignored: true }; }
   if (spans.length) audioUnfinished.set(result.source, { spans, hasText: spans.some(span => span.hasText) });
   else audioUnfinished.delete(result.source);
+  return outcome;
 }
 function markAudioGap(source, reason = 'audio-gap') {
   audioUnfinished.delete(source);
+  audioFinality.delete(source);
   if (source === 'you') { micCommands?.reset(); clearTimeout(micCommandTimer); micCommandTimer = null; }
   if (source !== questionSource) return;
   sourceNeedsFresh.add(source); turnAssembler?.reset(source); pendingBuffer?.invalidate(reason); clearQueue(reason);
@@ -463,19 +475,29 @@ function markAudioGap(source, reason = 'audio-gap') {
 function forwardTranscript(id, result) {
   if (!live || id !== sessionId) return;
   if (result.source === 'you' && activeSessionMode === 'call' && !includeMicContext) return;
-  if (result.isFinal && result.text) recordDiagnostic('transcript-final', 'Finalized question audio', { source: result.source, text: result.text, audioStart: result.start, audioDuration: result.duration });
-  if (sourceNeedsFresh.has(result.source)) {
-    // Continuations such as 'Return its length' cannot repair an unknown gap.
-    if (!result.isFinal || !isFreshQuestionStart(result.text)) {
-      if (result.isFinal && result.text) {
-        recordDiagnostic('question-decision', 'Still waiting for a full question after incomplete audio.', { decision: 'held', reason: 'needs-fresh-question', source: result.source, text: result.text });
-        reportHeldQuestion({ ...pendingBuffer.snapshot(), text: result.text, canRecover: false }, 'incomplete-audio');
-      }
+  if (result.isFinal && result.text) recordDiagnostic('transcript-final', 'Finalized question audio', { source: result.source, text: result.text, audioStart: result.start, audioDuration: result.duration, ...diagnosticAudioState(result.source) });
+  const before = JSON.stringify(diagnosticAudioState(result.source));
+  const outcome = trackFinalState(result);
+  const progress = diagnosticAudioState(result.source);
+  if (before !== JSON.stringify(progress) || outcome.ignored || (result.eventType === 'Results' && result.isFinal)) recordDiagnostic('speech-progress', outcome.ignored ? 'Ignored finalized or non-covering speech event' : 'Final-audio guard updated', {
+    source: result.source, eventType: result.eventType || (result.speechStarted ? 'SpeechStarted' : 'Results'),
+    isFinal: !!result.isFinal, speechFinal: !!result.speechFinal, fromFinalize: !!result.fromFinalize,
+    textLength: result.text.length, ignored: outcome.ignored, reason: outcome.reason,
+    audioStart: result.start, audioDuration: result.duration, ...progress });
+  if (outcome.ignored) return;
+  if (sourceNeedsFresh.has(result.source) && result.isFinal && result.text) {
+    // Keep tracking interims during recovery: a repeated full question can
+    // still finalize in pieces. Only reject the words of dependent finals,
+    // not their audio coverage or the new question's unfinished constraints.
+    if (!isFreshQuestionStart(result.text)) {
+      recordDiagnostic('question-decision', 'Still waiting for a full question after incomplete audio.', { decision: 'held', reason: 'needs-fresh-question', source: result.source, text: result.text });
+      reportHeldQuestion({ ...pendingBuffer.snapshot(), text: result.text, canRecover: false }, 'incomplete-audio');
+      turnAssembler?.push({ ...result, text: '', eventType: 'Results' });
+      for (const notify of [...finalWaiters]) notify();
       return;
     }
     sourceNeedsFresh.delete(result.source);
   }
-  trackFinalState(result);
   if (!result.isFinal && result.text) send('transcript', result);
   turnAssembler?.push(result);
   for (const notify of [...finalWaiters]) notify();
@@ -497,7 +519,7 @@ function onTranscript(id, result) {
   }, settings.incompletePauseMs);
   if (matched.command) {
     if (activeSessionMode === 'practice') {
-      const remaining = (audioUnfinished.get('you')?.spans || []).filter(span => span.hasText);
+      const remaining = audioFinality.get('you')?.clearPending({ vadOnly: true }) || [];
       if (remaining.length) audioUnfinished.set('you', { spans: remaining, hasText: true }); else audioUnfinished.delete('you');
       for (const notify of [...finalWaiters]) notify();
     }
@@ -704,6 +726,7 @@ function registerIPC() {
     if (!settings.autoAnswer) clearQueue('automatic-disabled', true);
     saveConfig();
     const current = publicSettings();
+    recordDiagnostic('session-preferences', 'Session controls changed', { sessionMode: settings.sessionMode, autoAnswer: settings.autoAnswer });
     send('session-preferences', { settings: current });
     return current;
   });
@@ -828,6 +851,7 @@ function registerIPC() {
         if (!live || id !== sessionId) { connection.stop(); throw new Error('Session cancelled.'); }
       }
       sessionTimer = setTimeout(() => { if (live && sessionId === id) stopSession('Session time limit reached.'); }, settings.maxMinutes * 60000);
+      recordDiagnostic('session-start', 'Listening session started', { ...diagnosticSessionSettings(), sources });
       send('session-started', { sessionId: id, startedAt, maxMinutes: settings.maxMinutes, sources, sessionMode: activeSessionMode, questionSource });
       return { ok: true, sessionId: id, sources, sessionMode: activeSessionMode, questionSource };
     } catch (error) { if (id === sessionId) stopSession('Could not start transcription.'); throw new Error(safeError(error)); }
@@ -845,7 +869,7 @@ function registerIPC() {
   handle('diagnostics:export', () => {
     const directory = path.join(dataDir, 'diagnostics'); fs.mkdirSync(directory, { recursive: true });
     const destination = path.join(directory, `diagnostics-${Date.now()}.json`);
-    const json = JSON.stringify({ version: 1, app: 'prateekAi', exportedAt: Date.now(), events: diagnosticsEvents }, null, 2);
+    const json = JSON.stringify({ version: 2, app: 'prateekAi', exportedAt: Date.now(), sessionSettings: diagnosticSessionSettings(), events: diagnosticsEvents }, null, 2);
     // Do not truncate JSON with safeError; redact known credentials across the export.
     let clean = json;
     for (const secret of [...Object.values(secrets), chatgptProfile?.access_token, chatgptProfile?.refresh_token, chatgptProfile?.id_token]) if (secret) clean = clean.split(secret).join('[redacted]');

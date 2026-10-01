@@ -1,7 +1,7 @@
 {
   "name": "prateekai",
   "productName": "prateekAi",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "description": "Windows technical conversation assistant",
   "main": "main.cjs",
