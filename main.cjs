@@ -5,7 +5,8 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { streamProviderAnswer, listProviderModels, validateBaseUrl } = require('./provider-adapters.cjs');
 const { SpeechSession } = require('./speech.cjs');
-const { TurnAssembler, looksLikeQuestion } = require('./turns.cjs');
+const { TurnAssembler, looksLikeQuestion, classifyTurn } = require('./turns.cjs');
+const { DEFAULT_VOICE_PHRASES, normalizeVoicePhrases, detectVoiceCommand, VoiceCommandMatcher, PendingQuestionBuffer } = require('./voice-fallback.cjs');
 const { resolveProfileDirectory, createProfileStore } = require('./profile.cjs');
 const { selectRoute } = require('./routing.cjs');
 const { beginSignIn, refreshProfile, listModels, revokeProfile } = require('./oauth.cjs');
@@ -21,11 +22,11 @@ const contentURL = pathToFileURL(path.join(__dirname, 'content.html')).href;
 const answerProviders = new Set(['chatgpt', 'openai', 'anthropic', 'gemini', 'compatible']);
 const defaultProviderModels = { chatgpt: 'gpt-5.6-sol', openai: 'gpt-5.6-sol', anthropic: 'claude-sonnet-5-5', gemini: 'gemini-3.8-flash', compatible: '' };
 const emptyFastModels = () => Object.fromEntries([...answerProviders].map(provider => [provider, '']));
-const timingRanges = { questionPauseMs: [400, 2500, 800], incompletePauseMs: [2000, 10000, 6500], answerTimeoutMs: [20000, 120000, 75000] };
+const timingRanges = { questionPauseMs: [400, 2500, 800], incompletePauseMs: [2000, 10000, 6500], answerTimeoutMs: [20000, 120000, 75000], voiceFreshnessMs: [30000, 180000, 90000], voiceCooldownMs: [2000, 10000, 3000], voiceFinalizeMs: [500, 3000, 1500] };
 const clampTiming = (value, [minimum, maximum, fallback]) => Number.isFinite(value) ? Math.max(minimum, Math.min(maximum, Math.round(value))) : fallback;
 const accessOrQuotaCodes = new Set(['subscription_sharing_usage_limit_exceeded', 'subscription_sharing_usage_unavailable', 'subscription_sharing_user_not_eligible',
   'insufficient_quota', 'rate_limit_exceeded', 'rate_limit_error', 'resource_exhausted', 'authentication_error', 'permission_error', 'SIGN_IN_REQUIRED', 'PLAN_ACCESS_REQUIRED']);
-let win, contentWin = null, contentWindowPromise = null, settings = { answerProvider: 'chatgpt', providerModels: { ...defaultProviderModels }, providerFastModels: emptyFastModels(), compatibleBaseUrl: '', model: 'gpt-5.6-sol', fastModel: '', adaptiveModels: true, mode: 'auto', depth: 'auto', context: '', roleTitle: '', roleDescription: '', sessionMode: 'call', autoAnswer: false, maxMinutes: 30, maxAutoAnswers: 20, questionPauseMs: 800, incompletePauseMs: 6500, answerTimeoutMs: 75000, answerFontSize: 20, backgroundOpacity: 92, motionEffects: true };
+let win, contentWin = null, contentWindowPromise = null, settings = { answerProvider: 'chatgpt', providerModels: { ...defaultProviderModels }, providerFastModels: emptyFastModels(), compatibleBaseUrl: '', model: 'gpt-5.6-sol', fastModel: '', adaptiveModels: true, mode: 'auto', depth: 'auto', context: '', roleTitle: '', roleDescription: '', sessionMode: 'call', autoAnswer: false, maxMinutes: 30, maxAutoAnswers: 20, questionPauseMs: 800, incompletePauseMs: 6500, answerTimeoutMs: 75000, answerFontSize: 20, backgroundOpacity: 92, motionEffects: true, voiceFallbackEnabled: false, voiceCommandPhrases: [...DEFAULT_VOICE_PHRASES], voiceFreshnessMs: 90000, voiceCooldownMs: 3000, voiceFinalizeMs: 1500, speechLanguage: 'en' };
 let secrets = { openai: '', anthropic: '', gemini: '', compatible: '', deepgram: '' };
 let chatgptProfile = null, authController, authGeneration = 0, hostId = `urn:uuid:${crypto.randomUUID()}`;
 const MODEL_CACHE_MS = 10 * 60000;
@@ -35,6 +36,11 @@ let live = false, sessionId = 0, speech = new Map(), history = [], answerHistory
 let sessionTimer, requestController, requestId = 0, autoCount = 0, answers = 0, startedAt = 0;
 let turnAssembler = null, queuedAutomatic = null, activeSessionMode = 'call', questionSource = 'remote', autoLimitNotice = false;
 let lastQuestionTiming = null;
+let pendingBuffer = null, micCommands = null, micCommandTimer = null, lastVoiceAt = -Infinity, includeMicContext = false;
+let answerQueue = [], voiceCommandStatus = null, pendingSubmission = null, providerBlockedMessage = '';
+const sourceNeedsFresh = new Set();
+const audioUnfinished = new Map(), finalWaiters = new Set(), diagnosticsEvents = [];
+const submittedQuestions = new Map();
 const answeredTurns = new Set();
 const recentAcceptedQuestions = new Map();
 const normalizedQuestion = text => text.toLowerCase().replace(/\s+/g, ' ').trim().replace(/[.!?]+$/, '').trim();
@@ -74,7 +80,7 @@ const allowedSessionModes = new Set(['call', 'practice']);
 const validModel = value => typeof value === 'string' && /^[a-z0-9][a-z0-9._:/-]{0,149}$/i.test(value);
 const clampOpacity = value => Number.isFinite(Number(value)) ? Math.max(45, Math.min(100, Math.round(Number(value)))) : 92;
 const clampTextSize = value => Number.isFinite(Number(value)) ? Math.max(16, Math.min(26, Math.round(Number(value)))) : 20;
-const contentMethods = new Set(['settings:get', 'content:state', 'answer:ask', 'answer:cancel', 'session:clear', 'listen:stop',
+const contentMethods = new Set(['settings:get', 'content:state', 'answer:submit-pending', 'answer:ask', 'answer:cancel', 'session:clear', 'listen:stop',
   'window:show-config', 'window:hide-content', 'window:content-close', 'window:show-content', 'window:resize-content', 'appearance:text-size', 'appearance:set']);
 const ensureSender = (event, method) => {
   const configSender = win && !win.isDestroyed() && event.sender === win.webContents && event.senderFrame?.url === pageURL;
@@ -84,7 +90,7 @@ const ensureSender = (event, method) => {
 const handle = (name, fn) => ipcMain.handle(name, (event, ...args) => { ensureSender(event, name); return fn(...args); });
 function contentState() {
   return { seq: eventSequence, settings: publicSettings(), live, startedAt, answers, question: lastQuestion, pendingQuestion,
-    answer: { ...answerSnapshot }, sources: { ...sourceStates } };
+    answer: { ...answerSnapshot }, sources: { ...sourceStates }, voiceCommandStatus };
 }
 function safeError(error) {
   let text = String(error?.message || error || 'Request failed.');
@@ -113,6 +119,9 @@ function readConfig() {
   if (!allowedDepths.has(settings.depth)) settings.depth = 'auto';
   if (!allowedSessionModes.has(settings.sessionMode)) settings.sessionMode = 'call';
   settings.autoAnswer = settings.autoAnswer === true;
+  settings.voiceFallbackEnabled = settings.voiceFallbackEnabled === true;
+  try { settings.voiceCommandPhrases = normalizeVoicePhrases(settings.voiceCommandPhrases); } catch { settings.voiceCommandPhrases = [...DEFAULT_VOICE_PHRASES]; }
+  settings.speechLanguage = settings.speechLanguage === 'multi' ? 'multi' : 'en';
   settings.adaptiveModels = settings.adaptiveModels !== false;
   settings.maxMinutes = Math.max(1, Math.min(60, Number(settings.maxMinutes) || 30));
   settings.maxAutoAnswers = Math.max(1, Math.min(60, Number(settings.maxAutoAnswers) || 20));
@@ -128,7 +137,7 @@ function saveConfig() {
   profileStore.save({ settings, secrets, chatgptProfile, hostId });
 }
 function publicSettings() {
-  return { ...settings, profileError, providerModels: { ...settings.providerModels }, providerFastModels: { ...settings.providerFastModels },
+  return { ...settings, profileError, voiceCommandDefaults: [...DEFAULT_VOICE_PHRASES], providerModels: { ...settings.providerModels }, providerFastModels: { ...settings.providerFastModels },
     hasOpenAI: !!secrets.openai, hasAnthropic: !!secrets.anthropic, hasGemini: !!secrets.gemini, hasCompatible: !!secrets.compatible, hasDeepgram: !!secrets.deepgram,
     hasAnswerProvider: !!credentialIdentity(),
     chatgptConnected: !!chatgptProfile, chatgptCanCall: !!chatgptProfile?.can_call_api, chatgptLabel: chatgptProfile?.accountLabel || '',
@@ -229,96 +238,264 @@ async function refreshModelCatalog({ force = false } = {}) {
   return operation.promise;
 }
 function cancelAnswer() { const wasActive = !!requestController; requestId++; requestController?.abort(); requestController = null; return wasActive; }
-function resetTurns() { turnAssembler?.reset(); turnAssembler = null; queuedAutomatic = null; lastQuestionTiming = null; answeredTurns.clear(); recentAcceptedQuestions.clear(); }
+function recordDiagnostic(kind, message, detail = {}) {
+  const entry = { at: Date.now(), sessionId, kind, message: safeError(message), ...detail };
+  diagnosticsEvents.push(entry);
+  if (diagnosticsEvents.length > 400) diagnosticsEvents.shift();
+  send('diagnostic', { entry });
+}
+function reportVoice(status, message, detail = {}) {
+  voiceCommandStatus = { status, message, at: Date.now(), ...detail };
+  send('voice-command-status', voiceCommandStatus);
+  recordDiagnostic('voice-command', message, { status, ...detail });
+}
+function syncQueue() { queuedAutomatic = answerQueue[0] || null; }
+function clearQueue(reason = 'cancelled', automaticOnly = false) {
+  answerQueue = answerQueue.filter(candidate => {
+    if (automaticOnly && candidate.trigger !== 'auto') return true;
+    submittedQuestions.set(candidate.key, reason);
+    recordDiagnostic('question-decision', 'Queued question ' + reason, { decision: reason, questionId: candidate.turnId, trigger: candidate.trigger });
+    return false;
+  });
+  syncQueue();
+}
+function resetTurns() {
+  turnAssembler?.reset(); turnAssembler = null; clearQueue('session-reset'); lastQuestionTiming = null;
+  answeredTurns.clear(); recentAcceptedQuestions.clear(); submittedQuestions.clear();
+  pendingBuffer = null; micCommands?.reset(); micCommands = null;
+  clearTimeout(micCommandTimer); micCommandTimer = null; lastVoiceAt = -Infinity;
+  audioUnfinished.clear(); sourceNeedsFresh.clear(); providerBlockedMessage = ''; for (const notify of [...finalWaiters]) notify(false); finalWaiters.clear();
+  pendingSubmission = null; voiceCommandStatus = null;
+}
 function stopSession(reason = 'Listening stopped.') {
-  resetTurns();
-  cancelAnswer();
-  live = false; captureAllowed = false; sessionId++;
+  resetTurns(); cancelAnswer(); live = false; captureAllowed = false; sessionId++;
   clearTimeout(sessionTimer); sessionTimer = null;
   for (const connection of speech.values()) connection.stop();
-  speech.clear();
-  send('session-stopped', { reason });
+  speech.clear(); send('session-stopped', { reason });
 }
 function publishTurn(id, turn, pending) {
-  if (!live || sessionId !== id) return;
+  if (!live || sessionId !== id || (turn.source === 'you' && activeSessionMode === 'call' && !includeMicContext)) return;
   const text = trim(turn.text, 8000);
   if (!text || !speech.has(turn.source)) return;
   const existing = history.find(entry => entry.turnId === turn.id);
   if (existing) { existing.text = text; existing.at = Date.now(); if (pending) existing.lastFinalAt = Date.now(); }
   else { history.push({ turnId: turn.id, source: turn.source, text, at: Date.now(), lastFinalAt: Date.now() }); history = history.slice(-160); }
   send('transcript', { source: turn.source, text, turnId: turn.id, isFinal: true, pending });
-  if (turn.source === questionSource && pending) send('question-preview', { text, turnId: turn.id, pending: true });
+  if (turn.source === questionSource && pending) send('question-preview', { text: pendingBuffer?.snapshot().text || text, turnId: turn.id, pending: true });
 }
 function automaticStillAllowed(candidate) {
-  const acceptedAt = candidate ? recentAcceptedQuestions.get(normalizedQuestion(candidate.question)) : undefined;
-  return candidate && live && candidate.sessionId === sessionId && candidate.sessionMode === activeSessionMode
-    && candidate.source === questionSource && settings.autoAnswer && !answeredTurns.has(candidate.turnId)
-    && (acceptedAt === undefined || Date.now() - acceptedAt >= 12000)
-    && looksLikeQuestion(candidate.question);
+  return !!candidate && live && candidate.sessionId === sessionId && candidate.sessionMode === activeSessionMode
+    && candidate.source === questionSource && (candidate.trigger !== 'auto' || settings.autoAnswer)
+    && (candidate.trigger !== 'auto' || looksLikeQuestion(candidate.question, { hasContext: !!lastQuestion || answerHistory.length > 0 }));
 }
 function pauseAutomatic(message) {
-  settings.autoAnswer = false; queuedAutomatic = null;
-  saveConfig();
-  send('session-preferences', { settings: publicSettings() });
-  send('notice', { message });
+  settings.autoAnswer = false; clearQueue('paused', true); saveConfig();
+  send('session-preferences', { settings: publicSettings() }); send('notice', { message });
 }
 function drainAutomatic() {
-  if (requestController || !queuedAutomatic) return;
-  const candidate = queuedAutomatic; queuedAutomatic = null;
-  if (!automaticStillAllowed(candidate)) return;
+  if (requestController || !answerQueue.length) return;
+  const candidate = answerQueue.shift(); syncQueue();
+  if (!automaticStillAllowed(candidate)) { recordDiagnostic('question-decision', 'Queued question no longer eligible', { decision: 'cancelled', questionId: candidate.turnId }); drainAutomatic(); return; }
   if (autoCount >= settings.maxAutoAnswers) {
-    if (!autoLimitNotice) send('notice', { message: 'Automatic-answer limit reached. Use Ask manually or start a new session.' });
+    submittedQuestions.set(candidate.key, 'limit-reached'); clearQueue('limit-reached');
     autoLimitNotice = true;
-    return;
+    send('notice', { message: 'Session answer limit reached. Use Ask manually or start a new session.' }); return;
   }
-  if (!credentialIdentity()) {
-    pauseAutomatic(`Automatic answers paused: ${missingAnswerProviderMessage()} Then enable Auto answers.`);
-    return;
+  if (!credentialIdentity() || !validModel(settings.model)) {
+    submittedQuestions.set(candidate.key, 'provider-unavailable'); clearQueue('provider-unavailable');
+    pauseAutomatic('Answers paused: check the selected provider, credentials, and main model in Setup.'); return;
   }
-  if (!validModel(settings.model)) { pauseAutomatic('Automatic answers paused: choose a valid main model for the selected provider in Setup.'); return; }
   ask({ question: candidate.question, automatic: true, candidate }).catch(error => send('notice', { message: safeError(error) }));
 }
+function queueSnapshot(snapshot, trigger) {
+  const key = `${sessionId}:${snapshot.id}:${snapshot.revision}`;
+  if (submittedQuestions.has(key) || snapshot.status === 'consumed') return { ok: false, message: 'This question is already submitted.' };
+  if (providerBlockedMessage) return { ok: false, message: providerBlockedMessage };
+  if (sourceNeedsFresh.has(questionSource)) return { ok: false, message: 'Audio was interrupted. Repeat the full question or enter it manually.' };
+  if (!snapshot.canRecover) return { ok: false, message: snapshot.reason === 'too-long' ? 'Question is too long. Review it manually.' : 'No pending question captured.' };
+  if (!credentialIdentity()) { const message = missingAnswerProviderMessage(); if (trigger === 'auto') pauseAutomatic('Automatic answers paused: ' + message); return { ok: false, message }; }
+  if (!validModel(settings.model)) return { ok: false, message: 'Choose a valid main model in Setup.' };
+  if (autoCount + answerQueue.length >= settings.maxAutoAnswers) return { ok: false, message: 'Session answer limit reached. Use Ask manually or start a new session.' };
+  if (answerQueue.length >= 10) return { ok: false, message: 'Answer queue is full. Wait for an answer before submitting this question.' };
+  const classification = classifyTurn(snapshot.text, { hasContext: !!lastQuestion });
+  let question = snapshot.text;
+  if (classification.kind === 'correction' && lastQuestion) question = `${lastQuestion}\nCorrection: ${snapshot.text}`;
+  if (question.length > 8000) return { ok: false, message: 'Question is too long. Review it manually.' };
+  if (classification.kind === 'correction') {
+    clearQueue('superseded');
+    if (cancelAnswer()) send('answer-cancelled');
+  }
+  const consumed = pendingBuffer.consume({ id: snapshot.id, revision: snapshot.revision });
+  if (!consumed.ok) return { ok: false, message: 'This question changed or was already submitted.' };
+  const candidate = { key, question, turnId: snapshot.id, revision: snapshot.revision, source: questionSource,
+    sessionId, sessionMode: activeSessionMode, trigger, referenceQuestion: lastQuestion, transcriptSnapshot: transcriptContext(), answerContext: answerHistory.map(entry => ({...entry})), readyAt: Date.now(), settleMs: Math.max(0, Date.now() - snapshot.updatedAt) };
+  submittedQuestions.set(key, 'queued'); answeredTurns.add(key);
+  if (trigger !== 'auto') turnAssembler?.discardPending?.(questionSource);
+  lastQuestion = question; lastQuestionTiming = candidate;
+  send('question-preview', { text: '', pending: false });
+  send('question', { text: question, turnId: snapshot.id, source: questionSource, trigger, settleMs: candidate.settleMs });
+  recordDiagnostic('question-decision', 'Question submitted', { decision: 'accepted', questionId: snapshot.id, revision: snapshot.revision, trigger, text: question });
+  answerQueue.push(candidate); syncQueue(); drainAutomatic();
+  return { ok: true, message: requestController && answerQueue.includes(candidate) ? 'Question queued.' : 'Answer requested.' };
+}
+function waitForFinal(id) {
+  if (!audioUnfinished.has(questionSource)) return Promise.resolve(true);
+  const connection = speech.get(questionSource);
+  if (!connection?.finalize?.()) return Promise.resolve(false);
+  return new Promise(resolve => {
+    let timer;
+    const notify = forced => {
+      if (forced !== false && live && sessionId === id && audioUnfinished.has(questionSource)) return;
+      clearTimeout(timer); finalWaiters.delete(notify);
+      resolve(forced !== false && live && sessionId === id && !audioUnfinished.has(questionSource));
+    };
+    finalWaiters.add(notify);
+    timer = setTimeout(() => notify(false), settings.voiceFinalizeMs);
+    notify();
+  });
+}
+async function submitPending(trigger = 'hotkey') {
+  if (!live) return { ok: false, message: 'Start listening to capture a question.' };
+  if (trigger === 'voice' && !settings.voiceFallbackEnabled) return { ok: false, message: 'Voice fallback is off.' };
+  if (pendingSubmission) return { ok: false, message: 'The pending question is already being submitted.' };
+  const id = sessionId, operation = {}; pendingSubmission = operation;
+  try {
+    if (!await waitForFinal(id)) return { ok: false, message: 'Question transcript is incomplete. Check audio or use the keyboard/manual fallback.' };
+    if (!live || id !== sessionId) return { ok: false, message: 'Listening session changed.' };
+    const result = queueSnapshot(pendingBuffer.snapshot(), trigger);
+    if (!result.ok) recordDiagnostic('question-decision', result.message, { decision: 'blocked', trigger });
+    return result;
+  } finally { if (pendingSubmission === operation) pendingSubmission = null; }
+}
+function rememberTurn(turn) {
+  if (turn.source !== questionSource || !pendingBuffer) return;
+  const classification = classifyTurn(turn.text, { hasContext: !!lastQuestion });
+  pendingBuffer.observe({ ...turn, reason: turn.reason || classification.reason });
+}
 function beginTurns(id) {
+  pendingBuffer = new PendingQuestionBuffer({ sessionId: id, source: questionSource, maxAgeMs: settings.voiceFreshnessMs, now: () => Date.now() });
+  pendingBuffer.reset({ sessionId: id, source: questionSource });
+  micCommands = new VoiceCommandMatcher({ phrases: settings.voiceCommandPhrases });
   turnAssembler = new TurnAssembler({ settleMs: settings.questionPauseMs, prefixMs: settings.incompletePauseMs,
-    now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout,
-    onUpdate: turn => publishTurn(id, turn, true),
+    now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, hasContext: () => !!lastQuestion,
+    onUpdate: turn => { rememberTurn(turn); publishTurn(id, turn, true); },
     onTurn: turn => {
       if (!live || sessionId !== id) return;
-      publishTurn(id, turn, false);
+      if (turn.reason === 'incomplete-audio') audioUnfinished.delete(turn.source);
+      rememberTurn(turn); publishTurn(id, turn, false);
       if (turn.source !== questionSource) return;
       send('question-preview', { text: '', turnId: turn.id, pending: false });
-      if (!turn.question) return;
-      lastQuestion = trim(turn.text, 8000);
-      const finalAt = history.find(entry => entry.turnId === turn.id)?.lastFinalAt;
-      const settleMs = finalAt === undefined ? undefined : Math.max(0, Date.now() - finalAt);
-      lastQuestionTiming = { question: lastQuestion, readyAt: Date.now(), settleMs };
-      send('question', { text: lastQuestion, turnId: turn.id, source: turn.source, settleMs });
-      if (settings.autoAnswer) {
-        // While one answer is streaming, keep only the latest completed question.
-        queuedAutomatic = { question: lastQuestion, turnId: turn.id, source: turn.source, sessionId: id, sessionMode: activeSessionMode, readyAt: Date.now(), settleMs };
-        drainAutomatic();
+      const snapshot = pendingBuffer.snapshot();
+      const classification = classifyTurn(snapshot.text, { hasContext: !!lastQuestion });
+      if (['acknowledgment', 'incomplete-audio', 'too-long'].includes(turn.reason) || !classification.question || !snapshot.canRecover) {
+        recordDiagnostic('question-decision', 'Question held: ' + (turn.reason || classification.reason), { decision: 'held', reason: turn.reason || classification.reason, questionId: snapshot.id }); return;
       }
+      if (settings.autoAnswer && !audioUnfinished.has(questionSource)) {
+        const result = queueSnapshot(snapshot, 'auto');
+        if (!result.ok) { recordDiagnostic('question-decision', result.message, { decision: 'blocked', trigger: 'auto' }); send('notice', { message: result.message }); }
+      } else { lastQuestion = snapshot.text; send('question', { text: snapshot.text, turnId: snapshot.id, source: questionSource }); lastQuestionTiming = { question: snapshot.text, readyAt: Date.now() }; recordDiagnostic('question-decision', 'Pending question ready', { decision: 'ready', questionId: snapshot.id }); }
     } });
+}
+function trackFinalState(result) {
+  let spans = audioUnfinished.get(result.source)?.spans || [];
+  if (result.speechStarted || (!result.isFinal && result.text)) {
+    const start = Number.isFinite(result.start) ? result.start : null;
+    const existing = spans.find(span => span.start === start);
+    if (existing) existing.hasText ||= !!result.text;
+    else spans.push({ start, hasText: !!result.text });
+    if (spans.length > 32) { markAudioGap(result.source, 'incomplete-audio'); return; }
+  } else if (result.isFinal && result.text) {
+    const end = Number.isFinite(result.start) ? result.start + (result.duration || 0) : null;
+    spans = spans.filter(span => span.start !== null && end !== null
+      && !(result.start <= span.start + 0.02 && end > span.start + 0.001));
+  }
+  if (spans.length) audioUnfinished.set(result.source, { spans, hasText: spans.some(span => span.hasText) });
+  else audioUnfinished.delete(result.source);
+}
+function markAudioGap(source, reason = 'audio-gap') {
+  audioUnfinished.delete(source);
+  if (source === 'you') { micCommands?.reset(); clearTimeout(micCommandTimer); micCommandTimer = null; }
+  if (source !== questionSource) return;
+  sourceNeedsFresh.add(source); turnAssembler?.reset(source); pendingBuffer?.invalidate(reason); clearQueue(reason);
+  for (const notify of [...finalWaiters]) notify(false);
+  send('question-preview', { text: '', pending: false });
+  recordDiagnostic('question-decision', 'Audio gap: repeat the full question or enter it manually.', { decision: 'incomplete', reason });
+}
+function forwardTranscript(id, result) {
+  if (!live || id !== sessionId) return;
+  if (result.source === 'you' && activeSessionMode === 'call' && !includeMicContext) return;
+  if (sourceNeedsFresh.has(result.source)) {
+    // Continuations such as 'Return its length' cannot repair an unknown gap.
+    const freshStart = /^(?:(?:new|next) (?:question|problem)[\s:,.]+)?(?:what|why|how|explain|describe|design|implement|write|given|you are given|can you|could you|ek |aapko |आपको|एक )/i.test(result.text.trim());
+    if (!result.isFinal || !freshStart) return;
+    sourceNeedsFresh.delete(result.source);
+  }
+  trackFinalState(result);
+  if (!result.isFinal && result.text) send('transcript', result);
+  if (result.isFinal && result.text) recordDiagnostic('transcript-final', 'Finalized question audio', { source: result.source, text: result.text, audioStart: result.start, audioDuration: result.duration });
+  turnAssembler?.push(result);
+  for (const notify of [...finalWaiters]) notify();
 }
 function onTranscript(id, result) {
   if (!live || sessionId !== id || !speech.has(result.source)) return;
-  const text = trim(result.text, 6000);
-  if (!result.isFinal && text) send('transcript', { ...result, text });
-  turnAssembler?.push({ ...result, text });
+  // Never truncate a provider segment into an apparently complete task.
+  if (typeof result.text === 'string' && result.text.length > 8000) {
+    markAudioGap(result.source, 'too-long'); send('notice', { message: 'Question is too long. Review it manually.' }); return;
+  }
+  const text = typeof result.text === 'string' ? result.text : '';
+  const input = { ...result, text };
+  if (result.source !== 'you' || !settings.voiceFallbackEnabled) { forwardTranscript(id, input); return; }
+  const matched = micCommands.push(input);
+  clearTimeout(micCommandTimer); micCommandTimer = null;
+  for (const part of matched.forward) forwardTranscript(id, part);
+  if (matched.holding) micCommandTimer = setTimeout(() => {
+    if (live && sessionId === id) for (const part of micCommands.flush().forward) forwardTranscript(id, part);
+  }, settings.incompletePauseMs);
+  if (matched.command) {
+    if (activeSessionMode === 'practice') {
+      const remaining = (audioUnfinished.get('you')?.spans || []).filter(span => span.hasText);
+      if (remaining.length) audioUnfinished.set('you', { spans: remaining, hasText: true }); else audioUnfinished.delete('you');
+      for (const notify of [...finalWaiters]) notify();
+    }
+    if (Date.now() - lastVoiceAt < settings.voiceCooldownMs) { reportVoice('ignored', 'Voice command already recognized.'); return; }
+    lastVoiceAt = Date.now();
+    reportVoice('recognized', 'Voice command recognized');
+    submitPending('voice').then(result => {
+      if (live && sessionId === id) reportVoice(result.ok ? 'submitted' : 'blocked', result.message);
+    }).catch(error => { if (live && sessionId === id) reportVoice('blocked', safeError(error)); });
+  }
+}
+function transcriptContext() {
+  return history.slice(-55).map(x => `${x.source === 'remote' ? 'Other speaker' : 'You'}: ${x.text}`).join('\n').slice(-18000);
+}
+function answerPromptContext(candidate) {
+  const transcript = candidate ? candidate.transcriptSnapshot : transcriptContext();
+  const prior = candidate ? [...candidate.answerContext] : [...answerHistory];
+  if (candidate?.referenceQuestion) {
+    const completed = answerHistory.findLast(entry => entry.question === candidate.referenceQuestion);
+    if (completed && !prior.some(entry => entry.question === completed.question && entry.text === completed.text)) prior.push(completed);
+  }
+  const reference = candidate?.referenceQuestion ? '\nPreceding question when this request was accepted (follow-up reference):\n' + candidate.referenceQuestion : '';
+  return transcript + reference + (prior.length ? '\nPrevious assistant suggestions (unverified; for follow-up context):\n' + prior.slice(-3).map(x => `Question: ${x.question}\nSuggestion: ${x.text}`).join('\n').slice(-7000) : '');
 }
 async function ask(input = {}) {
   // Only completed turns originating in this process can trigger paid auto requests.
   if (input.automatic && (!automaticStillAllowed(input.candidate) || requestController || autoCount >= settings.maxAutoAnswers)) return { ok: false };
-  if (!input.automatic) queuedAutomatic = null;
+  if (!input.automatic) clearQueue('manual-replacement');
   const question = trim(input.question || lastQuestion, 10000).trim();
   if (!question) throw new Error('Type a question or wait for a completed question from the call.');
   if (!credentialIdentity()) throw new Error(missingAnswerProviderMessage());
   if (!validModel(settings.model)) throw new Error('Choose a valid main model for the selected provider in Setup.');
+  if (!input.automatic && pendingBuffer) {
+    const pending = pendingBuffer.snapshot();
+    if (pending.canRecover && normalizedQuestion(pending.text) === normalizedQuestion(question)) pendingBuffer.consume({ id: pending.id, revision: pending.revision });
+  }
+  lastQuestion = question;
   const acceptedAt = Date.now(), identity = credentialIdentity(), generation = authGeneration, answerTimeoutMs = settings.answerTimeoutMs;
   const selectedProvider = settings.answerProvider, selectedBaseUrl = settings.compatibleBaseUrl;
   const availableModels = modelCatalog.status === 'ready' && modelCatalogIdentity === identity && Date.now() - modelCatalogAt < MODEL_CACHE_MS ? modelCatalog.models : [];
   const route = selectRoute({ question, provider: selectedProvider, model: settings.model, fastModel: settings.fastModel, adaptiveModels: settings.adaptiveModels, availableModels,
-    mode: settings.mode, depth: settings.depth, previousQuestion: answerHistory.at(-1)?.question });
+    mode: settings.mode, depth: settings.depth, previousQuestion: input.candidate?.referenceQuestion || answerHistory.at(-1)?.question });
   const referenceContext = settings.roleTitle || settings.roleDescription
     ? JSON.stringify({ candidateSummary: settings.context, roleTitle: settings.roleTitle, roleDescription: settings.roleDescription }) : settings.context;
   const answerSettings = { mode: settings.mode, depth: settings.depth, context: referenceContext };
@@ -333,9 +510,10 @@ async function ask(input = {}) {
   answers++;
   for (const [text, at] of recentAcceptedQuestions) if (Date.now() - at >= 12000) recentAcceptedQuestions.delete(text);
   recentAcceptedQuestions.set(normalizedQuestion(question), Date.now());
-  if (input.automatic) { autoCount++; answeredTurns.add(input.candidate.turnId); }
+  if (input.automatic) { autoCount++; submittedQuestions.set(input.candidate.key, 'generating'); }
   send('answer-start', { id, question, automatic: !!input.automatic, answers, autoCount,
-    provider: selectedProvider, model: route.model, routeKind: route.kind, settleMs, queueWaitMs });
+    provider: selectedProvider, model: route.model, routeKind: route.kind, trigger: input.candidate?.trigger || 'manual', settleMs, queueWaitMs });
+  recordDiagnostic('answer-start', 'Request sent', { trigger: input.candidate?.trigger || 'manual', provider: selectedProvider, model: route.model, settleMs, queueWaitMs });
   try {
     let key = secrets[selectedProvider] || '';
     if (selectedProvider === 'chatgpt') {
@@ -355,25 +533,31 @@ async function ask(input = {}) {
     if (id !== requestId || credentialIdentity() !== identity || controller.signal.aborted) return { ok: false };
     send('answer-phase', { id, phase: 'waiting-first-text' });
     const result = await streamProviderAnswer({ provider: selectedProvider, apiKey: key, baseUrl: selectedBaseUrl, model: route.model, reasoningEffort: route.reasoningEffort, concise: route.concise, question,
-      transcript: history.slice(-55).map(x => `${x.source === 'remote' ? 'Other speaker' : 'You'}: ${x.text}`).join('\n').slice(-18000)
-        + (answerHistory.length ? '\nPrevious assistant suggestions (unverified; for follow-up context):\n' + answerHistory.map(x => `Question: ${x.question}\nSuggestion: ${x.text}`).join('\n').slice(-7000) : ''),
+      transcript: answerPromptContext(input.candidate),
       ...answerSettings, signal: controller.signal,
       onDelta: text => {
         if (id !== requestId || credentialIdentity() !== identity) return;
         if (firstTextMs === null && typeof text === 'string' && text.trim()) {
           firstTextMs = Math.max(0, Date.now() - acceptedAt);
-          send('answer-timing', { id, firstTextMs, provider: selectedProvider, model: route.model, routeKind: route.kind, settleMs, queueWaitMs });
+          recordDiagnostic('answer-timing', 'First useful answer text', { firstTextMs, provider: selectedProvider, model: route.model, settleMs, queueWaitMs });
+        send('answer-timing', { id, firstTextMs, provider: selectedProvider, model: route.model, routeKind: route.kind, settleMs, queueWaitMs });
         }
         send('answer-delta', { id, text });
       } });
     if (id === requestId && credentialIdentity() === identity) {
+      providerBlockedMessage = '';
+      if (input.candidate) submittedQuestions.set(input.candidate.key, 'answered');
       answerHistory.push({ question, text: result.text.slice(0, 5000), provider: selectedProvider, model: route.model, routeKind: route.kind }); answerHistory = answerHistory.slice(-3);
       send('answer-done', { id, usage: result.usage, provider: selectedProvider, model: route.model, routeKind: route.kind, elapsedMs: Math.max(0, Date.now() - acceptedAt), firstTextMs, settleMs, queueWaitMs });
     }
   } catch (error) {
     if (id === requestId) {
+      if (input.candidate) submittedQuestions.set(input.candidate.key, 'failed');
+      recordDiagnostic('answer-error', safeError(error), { provider: selectedProvider, trigger: input.candidate?.trigger || 'manual' });
       send('answer-error', { id, message: controller.signal.aborted ? 'Answer interrupted or timed out. Partial text may be incomplete.' : safeError(error) });
-      if (input.automatic && !controller.signal.aborted && ([400, 401, 403, 404, 429].includes(error?.status) || accessOrQuotaCodes.has(error?.code))) {
+      if (!controller.signal.aborted && ([400, 401, 403, 404, 429].includes(error?.status) || accessOrQuotaCodes.has(error?.code))) {
+        providerBlockedMessage = 'Provider access or usage error. Check Setup and restart listening, or retry manually.';
+        clearQueue('provider-blocked');
         pauseAutomatic('Automatic answers paused after a provider access or usage error. Check the error and your account/model settings before enabling Auto again.');
       }
     }
@@ -473,7 +657,7 @@ function registerIPC() {
     if (live && Object.hasOwn(value, 'sessionMode')) throw new Error('Stop listening before changing between Call and Practice.');
     if (Object.hasOwn(value, 'sessionMode')) settings.sessionMode = value.sessionMode;
     if (Object.hasOwn(value, 'autoAnswer')) settings.autoAnswer = value.autoAnswer;
-    if (!settings.autoAnswer) queuedAutomatic = null;
+    if (!settings.autoAnswer) clearQueue('automatic-disabled', true);
     saveConfig();
     const current = publicSettings();
     send('session-preferences', { settings: current });
@@ -541,7 +725,13 @@ function registerIPC() {
     const credentialChanged = nextSecrets[provider] !== secrets[provider];
     const selectedChanged = providerChanged || model !== settings.model || fastModel !== settings.fastModel
       || credentialChanged || destinationChanged;
+    const phrases = Object.hasOwn(value, 'voiceCommandPhrases') ? normalizeVoicePhrases(value.voiceCommandPhrases) : settings.voiceCommandPhrases;
+    if (value.voiceFallbackEnabled !== undefined && typeof value.voiceFallbackEnabled !== 'boolean') throw new Error('Invalid voice fallback setting.');
+    if (value.speechLanguage !== undefined && !['en', 'multi'].includes(value.speechLanguage)) throw new Error('Choose English or English + Hindi.');
     secrets = nextSecrets;
+    settings.voiceCommandPhrases = phrases;
+    if (typeof value.voiceFallbackEnabled === 'boolean') settings.voiceFallbackEnabled = value.voiceFallbackEnabled;
+    if (value.speechLanguage) settings.speechLanguage = value.speechLanguage;
     settings.answerProvider = provider;
     settings.providerModels[provider] = model; settings.providerFastModels[provider] = fastModel;
     settings.model = model; settings.fastModel = fastModel; settings.compatibleBaseUrl = baseUrl;
@@ -576,23 +766,19 @@ function registerIPC() {
     live = true; captureAllowed = activeSessionMode === 'call'; const id = ++sessionId;
     startedAt = Date.now(); autoCount = 0; answers = 0; autoLimitNotice = false; lastQuestion = ''; history = []; answerHistory = [];
     send('session-reset', { reason: 'new-session' });
-    const sources = activeSessionMode === 'practice' ? ['you'] : (value?.microphone ? ['remote', 'you'] : ['remote']);
+    includeMicContext = activeSessionMode === 'practice' || (value?.includeMicContext === undefined ? !!value?.microphone : value.includeMicContext === true);
+    const sources = activeSessionMode === 'practice' ? ['you'] : ((value?.microphone || settings.voiceFallbackEnabled) ? ['remote', 'you'] : ['remote']);
     beginTurns(id);
     try {
       for (const source of sources) {
-        const connection = new SpeechSession({ apiKey: secrets.deepgram, source, sampleRate: rate,
+        const connection = new SpeechSession({ apiKey: secrets.deepgram, source, sampleRate: rate, language: settings.speechLanguage,
           onTranscript: data => onTranscript(id, data),
           onState: state => { if (live && sessionId === id) {
             send('speech-state', { source, state });
-            if (state === 'reconnecting' && source === questionSource) {
-              // A transport gap can lose the continuation of a prompt. Retain
-              // its visible transcript, but never auto-answer that stale fragment.
-              turnAssembler?.reset(source); queuedAutomatic = null;
-              send('question-preview', { text: '', pending: false });
-            }
+            if (state === 'reconnecting') markAudioGap(source);
             if (state === 'stopped') stopSession('Transcription ended. Start again to reconnect.');
           } },
-          onError: message => { if (live && sessionId === id) send('notice', { message: safeError(message) }); } });
+          onError: message => { if (live && sessionId === id) { if (/dropped|missing|buffer full/i.test(message)) markAudioGap(source); recordDiagnostic('speech-error', message); send('notice', { message: safeError(message) }); } } });
         speech.set(source, connection);
         await connection.start();
         if (!live || id !== sessionId) { connection.stop(); throw new Error('Session cancelled.'); }
@@ -605,7 +791,24 @@ function registerIPC() {
   handle('listen:stop', () => { stopSession(); cancelAnswer(); return { ok: true }; });
   handle('capture:failed', message => { stopSession(trim(message, 250)); return { ok: true }; });
   handle('answer:ask', data => ask({ question: data?.question }));
-  handle('answer:cancel', () => { queuedAutomatic = null; cancelAnswer(); send('answer-cancelled'); });
+  handle('answer:submit-pending', () => submitPending('hotkey'));
+  handle('voice:test', value => {
+    if (!value || typeof value.text !== 'string' || value.text.length > 8000) throw new Error('Enter a phrase of at most 8000 characters.');
+    const result = detectVoiceCommand(value.text, { phrases: value.phrases === undefined ? settings.voiceCommandPhrases : normalizeVoicePhrases(value.phrases) });
+    return { matched: result.matched, phrase: result.phrase, message: result.matched ? 'Phrase recognized. No request was sent.' : 'No command matched. No request was sent.' };
+  });
+  handle('diagnostics:get', () => ({ events: diagnosticsEvents.slice(), summary: 'Local session diagnostics. No raw audio or credentials.' }));
+  handle('diagnostics:export', () => {
+    const directory = path.join(dataDir, 'diagnostics'); fs.mkdirSync(directory, { recursive: true });
+    const destination = path.join(directory, `diagnostics-${Date.now()}.json`);
+    const json = JSON.stringify({ version: 1, app: 'prateekAi', exportedAt: Date.now(), events: diagnosticsEvents }, null, 2);
+    // Do not truncate JSON with safeError; redact known credentials across the export.
+    let clean = json;
+    for (const secret of [...Object.values(secrets), chatgptProfile?.access_token, chatgptProfile?.refresh_token, chatgptProfile?.id_token]) if (secret) clean = clean.split(secret).join('[redacted]');
+    fs.writeFileSync(destination, clean, { encoding: 'utf8', mode: 0o600 });
+    return { ok: true, path: destination, message: 'Diagnostics exported locally. Review the transcript text before sharing.' };
+  });
+  handle('answer:cancel', () => { clearQueue('cancelled'); cancelAnswer(); send('answer-cancelled'); });
   handle('session:clear', () => { if (live) throw new Error('Stop listening before clearing the session.'); resetTurns(); cancelAnswer(); history = []; answerHistory = []; lastQuestion = ''; answers = 0; startedAt = 0; send('session-reset', { reason: 'cleared' }); return { ok: true }; });
   ipcMain.on('audio:chunk', (e, source, data) => {
     try {
@@ -657,7 +860,7 @@ async function createContentWindow() {
   if (shutdown || !win || win.isDestroyed()) throw new Error('The configuration window has closed.');
   const area = screen.getDisplayMatching(win.getBounds()).workArea;
   const width = Math.min(740, area.width), height = Math.min(660, area.height);
-  const target = new BrowserWindow({ width, height, minWidth: Math.min(520, area.width), minHeight: Math.min(420, area.height),
+  const target = new BrowserWindow({ icon: path.join(__dirname, 'assets', 'prateekAi.ico'), width, height, minWidth: Math.min(520, area.width), minHeight: Math.min(420, area.height),
     x: Math.max(area.x, area.x + area.width - width - 24), y: Math.max(area.y, Math.min(area.y + 72, area.y + area.height - height)),
     resizable: true, maximizable: false, show: false, frame: false, transparent: true, backgroundColor: '#00000000',
     alwaysOnTop: !smoke && !captureTest, skipTaskbar: true,
@@ -684,7 +887,7 @@ async function createContentWindow() {
 async function createWindow() {
   Menu.setApplicationMenu(null);
   const area = screen.getPrimaryDisplay().workArea;
-  win = new BrowserWindow({ width: Math.min(1000, area.width), height: Math.min(760, area.height), minWidth: Math.min(780, area.width), minHeight: Math.min(600, area.height), resizable: true, maximizable: false,
+  win = new BrowserWindow({ icon: path.join(__dirname, 'assets', 'prateekAi.ico'), width: Math.min(1000, area.width), height: Math.min(760, area.height), minWidth: Math.min(780, area.width), minHeight: Math.min(600, area.height), resizable: true, maximizable: false,
     show: false, frame: false, transparent: false, backgroundColor: '#0b1013', alwaysOnTop: false, skipTaskbar: false,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false,
       sandbox: true, webSecurity: true, spellcheck: false, devTools: false, backgroundThrottling: false } });

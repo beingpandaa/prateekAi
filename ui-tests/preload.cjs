@@ -1,9 +1,13 @@
 const { contextBridge, ipcRenderer } = require('electron');
-let listener, asks = [], currentAsk, rejected = false, saveCount = 0, appearance = [], preferences = [], starts = [], stops = 0, modelRefreshes = 0, credentialFields = [], textSizes = [], contentOpens = [];
+let listener, asks = [], currentAsk, rejected = false, saveCount = 0, appearance = [], preferences = [], starts = [], stops = 0, modelRefreshes = 0, credentialFields = [], textSizes = [], contentOpens = [], voiceTests = [], diagnosticReads = 0, diagnosticExports = 0;
 const settings = { answerProvider: 'openai', providerModels: {openai:'test-model'}, providerFastModels:{}, model: 'test-model', mode: 'auto', depth: 'auto', sessionMode: 'call', context: '', autoAnswer: false, maxMinutes: 5, maxAutoAnswers: 5, backgroundOpacity: 78, hasOpenAI: false, hasDeepgram: false, chatgptConnected: false, encryptedStorage: true, protectionRequested: true };
+Object.assign(settings, { profileError: 'Saved profile could not be read. Setup is read-only until recovery.', speechLanguage: 'en', voiceFallbackEnabled: false, voiceCommandDefaults: ['Give me a minute to think.', 'Let me think through this for a moment.', 'Let me work through this step by step.', 'Ek minute, mujhe sochne dijiye.'], voiceCommandPhrases: ['Give me a minute to think.', 'Let me think through this for a moment.', 'Let me work through this step by step.', 'Ek minute, mujhe sochne dijiye.'], voiceFreshnessMs: 90000, voiceCooldownMs: 3000, voiceFinalizeMs: 1500 });
 const emit = event => listener?.(event);
 contextBridge.exposeInMainWorld('prateekAi', {
   settings: async () => ({ ...settings }),
+  testVoiceCommand: async input => { voiceTests.push(input); return { matched: input.phrases.includes(input.text), phrase: input.text }; },
+  diagnostics: async () => { diagnosticReads++; return { events: [{ at: 1000, kind: 'question-ready', message: '<img src=x onerror=window.__diagnosticUnsafe=true> No raw question included.' }, { at: 2000, kind: 'voice-command', message: 'Command accepted.' }] }; },
+  exportDiagnostics: async () => { diagnosticExports++; return { ok: true, path: 'C:\\mock-tests\\diagnostics.json' }; },
   showContent: async options => { contentOpens.push(options); },
   setTextSize: async value => { textSizes.push(value); settings.answerFontSize=value; return value; },
   saveSettings: async value => {
@@ -39,6 +43,6 @@ contextBridge.exposeInMainWorld('prateekAi', {
 contextBridge.exposeInMainWorld('uiTest', {
   emit, rejectNext: () => { rejected = true; },
   finish: event => { emit(event); currentAsk?.({ ok: true }); },
-  counts: () => ({ asks: asks.length, lastAsk: asks.at(-1), saveCount, appearance, preferences, starts, stops, modelRefreshes, adaptiveModels: settings.adaptiveModels, provider:settings.answerProvider, model:settings.model, fastModel:settings.fastModel, credentialFields, textSizes, contentOpens, roleTitle:settings.roleTitle,roleDescription:settings.roleDescription,context:settings.context,timing:[settings.questionPauseMs,settings.incompletePauseMs,settings.answerTimeoutMs] }),
+  counts: () => ({ asks: asks.length, lastAsk: asks.at(-1), saveCount, appearance, preferences, starts, stops, modelRefreshes, adaptiveModels: settings.adaptiveModels, provider:settings.answerProvider, model:settings.model, fastModel:settings.fastModel, credentialFields, textSizes, contentOpens, roleTitle:settings.roleTitle,roleDescription:settings.roleDescription,context:settings.context,timing:[settings.questionPauseMs,settings.incompletePauseMs,settings.answerTimeoutMs], voiceTests, diagnosticReads, diagnosticExports, voice: {enabled:settings.voiceFallbackEnabled,phrases:settings.voiceCommandPhrases,freshness:settings.voiceFreshnessMs,cooldown:settings.voiceCooldownMs,finalize:settings.voiceFinalizeMs,language:settings.speechLanguage} }),
   setSettings: value => { Object.assign(settings, value); emit({ type: 'session-preferences', settings: { ...settings } }); },
 });

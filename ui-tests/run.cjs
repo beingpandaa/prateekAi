@@ -1,7 +1,7 @@
 'use strict';
 const {app,BrowserWindow,session}=require('electron');
 const fs=require('node:fs'),path=require('node:path');
-const out=path.resolve(__dirname,'../../ui-refresh-tests');
+const out=path.resolve(__dirname,'../../voice-ui-tests');
 app.setPath('userData',path.join(out,'profile-v05'));
 const checks=[],errors=[];let win;
 const deadline=setTimeout(()=>app.exit(2),30000);
@@ -16,6 +16,7 @@ app.whenReady().then(async()=>{
  const checks=[],$=id=>document.getElementById(id),tick=()=>new Promise(r=>setTimeout(r,40));
  const check=(name,value)=>{checks.push({name,passed:!!value});if(!value)throw new Error(name)};
  await tick();const smoke=await runSmokeTest();check('Configuration boot and API bridge',smoke.ok);
+ check('Profile recovery warning is visible from the settings snapshot',!$('profileWarning').classList.contains('hidden')&&$('profileWarning').textContent.includes('read-only'));uiTest.emit({type:'notice',message:'An ordinary session notice'});check('Ordinary notices cannot erase a profile recovery warning',$('profileWarning').textContent.includes('read-only'));uiTest.setSettings({profileError:''});check('A recovered profile clears its dedicated warning',$('profileWarning').classList.contains('hidden'));
  check('Configuration has no answer composer or decorative hero',!$('question')&&!$('answer')&&!$('setupHero'));
  check('No native popup form controls',document.querySelectorAll('select,[title],input[type=file],[required]').length===0);
  $('openContent').click();await tick();check('Answer window button delegates without capture',uiTest.counts().contentOpens[0].hideConfig===true&&uiTest.counts().starts.length===0);
@@ -24,6 +25,15 @@ app.whenReady().then(async()=>{
  $('callMode').click();await tick();check('Live call restores optional microphone',!$('includeMic').checked&&!$('includeMic').disabled);
  $('listen').click();await tick();check('Missing speech key prevents audio start',uiTest.counts().starts.length===0&&$('settingsMessage').textContent.includes('Deepgram'));
  $('answersTab').click();check('Answers tab navigation',!$('answersPanel').classList.contains('hidden')&&$('connectionsPanel').classList.contains('hidden'));
+ check('Voice fallback defaults off and command controls are disabled',!$('voiceFallbackEnabled').checked&&$('voiceCommandPhrases').matches(':disabled')&&$('voiceStreamCost').classList.contains('hidden'));
+ check('Voice timing defaults are visible',[+$('voiceFreshnessMs').value,+$('voiceCooldownMs').value,+$('voiceFinalizeMs').value].join()==='90000,3000,1500');
+ $('voiceFallbackEnabled').click();check('Enabling voice fallback shows its added stream cost before Start',!$('voiceCommandPhrases').matches(':disabled')&&!$('voiceStreamCost').classList.contains('hidden')&&$('voiceStreamCost').textContent.includes('two paid speech streams')&&$('voiceStreamCost').textContent.includes('commands only'));
+ $('voiceCommandPhrases').value='my custom command';$('voiceCommandPhrases').dispatchEvent(new Event('input'));$('voiceTestText').value='my custom command';$('testVoiceCommand').click();await tick();check('Phrase tester uses the unsaved draft with no capture or answer request',uiTest.counts().voiceTests.at(-1).phrases.join()==='my custom command'&&$('voiceTestResult').textContent.includes('Recognized')&&uiTest.counts().asks===0&&uiTest.counts().starts.length===0);
+ $('voiceTestText').value='an ordinary statement';$('testVoiceCommand').click();await tick();check('Phrase tester explains a nonmatching utterance',$('voiceTestResult').textContent.includes('Not a command'));
+ $('restoreVoicePhrases').click();check('Restore uses defaults supplied by main',$('voiceCommandPhrases').value.includes('Give me a minute to think')&&$('voiceCommandPhrases').value.includes('Ek minute, mujhe sochne dijiye'));
+ $('voiceFreshnessMs').value='120000';$('voiceCooldownMs').value='4500';$('voiceFinalizeMs').value='2000';$('voiceFreshnessMs').dispatchEvent(new Event('input'));check('Voice sliders explain their values',$('voiceFreshnessValue').textContent==='120 s'&&$('voiceCooldownValue').textContent==='4.5 s'&&$('voiceFinalizeValue').textContent==='2 s');
+ const voiceOpens=uiTest.counts().contentOpens.length;$('openContent').click();await tick();check('Unsaved voice settings cannot silently start using old behavior',uiTest.counts().contentOpens.length===voiceOpens&&$('settingsMessage').textContent.includes('Unsaved'));
+ $('connectionsTab').click();document.querySelector('[data-speech-language=multi]').click();check('Hinglish is an explicit speech-language choice',document.querySelector('[data-speech-language=multi]').getAttribute('aria-pressed')==='true');$('answersTab').click();
  $('answerFontSize').value=24;$('answerFontSize').dispatchEvent(new Event('input'));$('answerFontSize').dispatchEvent(new Event('change'));await tick();check('Text size updates and persists',$('textSizeValue').textContent==='24 px'&&uiTest.counts().textSizes.at(-1)===24);
  $('backgroundOpacity').value=92;$('backgroundOpacity').dispatchEvent(new Event('input'));$('backgroundOpacity').dispatchEvent(new Event('change'));await tick();check('Popup opacity persists without fading setup',uiTest.counts().appearance.at(-1)===92&&getComputedStyle(document.body).backgroundColor==='rgb(17, 22, 29)');
  $('refreshModels').click();await tick();check('Account model discovery available',$('modelCatalogStatus').textContent.includes('gpt-6-luna'));
@@ -32,10 +42,13 @@ app.whenReady().then(async()=>{
  $('incompletePauseMs').value=2000;$('questionPauseMs').value=2500;$('questionPauseMs').dispatchEvent(new Event('input'));check('Incomplete window respects completed pause',+$('incompletePauseMs').value>=+$('questionPauseMs').value);
  $('resetTiming').click();check('Recommended thresholds restore',[+$('questionPauseMs').value,+$('incompletePauseMs').value,+$('answerTimeoutMs').value].join()==='800,6500,75000');
  $('contextTab').click();$('roleTitle').value='Senior Engineer';$('roleDescription').value='Design distributed services';$('context').value='Built a CRM integration';$('save').click();$('save').click();check('Save has immediate double-click guard',$('save').disabled);await tick();check('Role requirements and candidate facts persist separately',uiTest.counts().saveCount===1&&uiTest.counts().roleTitle==='Senior Engineer'&&uiTest.counts().roleDescription==='Design distributed services'&&uiTest.counts().context==='Built a CRM integration');
+ check('Voice preferences and language persist together',uiTest.counts().voice.enabled&&uiTest.counts().voice.freshness===120000&&uiTest.counts().voice.cooldown===4500&&uiTest.counts().voice.finalize===2000&&uiTest.counts().voice.language==='multi');
  $('connectionsTab').click();$('openaiKey').value='UNSAVED-OTHER-KEY';document.querySelector('[data-provider=anthropic]').click();$('anthropicKey').value='FAKE-CLAUDE-TEST-ONLY';$('answersTab').click();$('model').value='claude-sonnet-5-5';$('save').click();await tick();check('Only selected provider key is submitted',uiTest.counts().credentialFields.join()==='anthropicKey');check('Successful save clears selected credential input',$('anthropicKey').value==='');check('Other provider draft preserved',$('openaiKey').value==='UNSAVED-OTHER-KEY');
  $('sessionTab').click();uiTest.emit({type:'transcript',source:'you',turnId:'1',text:'Can you explain',isFinal:true});uiTest.emit({type:'transcript',source:'you',turnId:'1',text:'Can you explain closures?',isFinal:true});check('Speech fragments update one transcript row',$('transcript').children.length===1&&$('transcript').textContent.includes('closures'));
  uiTest.emit({type:'transcript',source:'remote',turnId:'2',text:'<img src=x onerror=alert(1)>',isFinal:true});check('Transcript renders untrusted HTML as text',!$('transcript').querySelector('img')&&$('transcript').textContent.includes('<img'));
  uiTest.emit({type:'hotkey-answer'});check('Configuration does not duplicate popup inference',uiTest.counts().asks===0);
+ $('diagnosticsDetails').open=true;await tick();check('Local diagnostics show recent events as safe text',uiTest.counts().diagnosticReads===1&&!window.__diagnosticUnsafe&&!$('diagnosticsEvents').querySelector('img')&&$('diagnosticsEvents').firstElementChild.textContent.includes('Command accepted'));
+ $('exportDiagnostics').click();await tick();check('Diagnostics export uses local IPC and shows its output path',uiTest.counts().diagnosticExports===1&&$('diagnosticsMessage').textContent.includes('diagnostics.json')&&uiTest.counts().asks===0);
  $('connectionsTab').focus();$('connectionsTab').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));check('Tabs support keyboard navigation',document.activeElement===$('answersTab'));
  uiTest.emit({type:'settings-changed',settings:{answerFontSize:22,backgroundOpacity:95}});check('Popup appearance changes synchronize setup',$('answerFontSize').value==='22'&&$('backgroundOpacity').value==='95');
  $('contextTab').click();$('roleTitle').value='Unsaved role';const opens=uiTest.counts().contentOpens.length;$('openContent').click();await tick();check('Unsaved role cannot silently use old answer context',uiTest.counts().contentOpens.length===opens&&$('notice').textContent.includes('Save setup'));
@@ -46,6 +59,8 @@ app.whenReady().then(async()=>{
  })()`);
  checks.push(...result);fs.writeFileSync(path.join(out,'setup.png'),(await win.webContents.capturePage()).toPNG());
  await run("document.getElementById('contextTab').click();new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");fs.writeFileSync(path.join(out,'setup-role.png'),(await win.webContents.capturePage()).toPNG());
+ await run("document.getElementById('answersTab').click();document.querySelector('.voice-fallback').scrollIntoView({block:'start'});new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");fs.writeFileSync(path.join(out,'setup-voice.png'),(await win.webContents.capturePage()).toPNG());
+ await run("document.getElementById('sessionTab').click();document.getElementById('diagnosticsPanel').scrollIntoView({block:'start'});new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");fs.writeFileSync(path.join(out,'setup-diagnostics.png'),(await win.webContents.capturePage()).toPNG());
  for(const [width,height]of[[780,600],[1280,900]]){
  win.setSize(width,height);await new Promise(r=>setTimeout(r,70));
  const geometry=await run(`(()=>{const panels=['connections','answers','context','session'];return panels.map(name=>{document.getElementById(name+'Tab').click();const save=document.getElementById('save').getBoundingClientRect();return {name,ok:document.documentElement.scrollWidth<=innerWidth&&save.bottom<=innerHeight&&save.right<=innerWidth};})})()`);

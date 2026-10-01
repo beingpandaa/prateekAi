@@ -14,7 +14,7 @@ function cleanText(value) {
 
 function questionBody(text) {
   return cleanText(text).toLowerCase()
-    .replace(/^[\s.,!?;:…'"“”‘’()[\]{}]+|[\s.,!?;:…'"“”‘’()[\]{}]+$/g, '')
+    .replace(/^[\s.,!?;:…।'"“”‘’()[\]{}]+|[\s.,!?;:…।'"“”‘’()[\]{}]+$/g, '')
     .replace(/^(?:(?:okay|ok|so|well|now|uh|um|alright|right)[\s.,!?;:…]+)+/, '').trim();
 }
 
@@ -50,21 +50,46 @@ function incompleteQuestion(text) {
   return /\b(?:the|a|an|between|and|or|versus|vs|using)$/.test(body);
 }
 
-function looksLikeQuestion(value) {
+function classifyTurn(value, { hasContext = false } = {}) {
   const text = cleanText(value);
-  const body = questionBody(text);
-  if (!body || incompleteQuestion(text)) return false;
-  if (/^(?:yes|no|okay|ok|right|sure|hmm|uh|um|thanks|thank you|sorry|hello|hi|fine|good|great|yep|yeah|so|well|you|me)$/.test(body)) return false;
+  const body = questionBody(text).replace(/^(?:new|next) question[\s:,.]+/, '');
+  const result = (question, reason, kind = reason) => ({ question, reason, kind });
+  if (!body) return result(false, 'empty');
+  // Coordination is not an interview task, even when ASR adds a question mark.
+  if (/^(?:yes|no|okay|ok|right|sure|hmm|uh|um|thanks|thank you|sorry|hello|hi|fine|good|great|yep|yeah|so|well|you|me|understood|got it|(?:did|do) you (?:get|understand) (?:it|that|this|the question)|(?:can|could) you hear me|am i audible|are you there|does that make sense|samajh (?:aaya|aya)|sun (?:rahe|pa rahe) ho|samajh gaye|समझ आया|समझ गए|सुन रहे हो)$/.test(body)) return result(false, 'acknowledgment');
+  if (/^(?:(?:give me|gimme) a minute to think|let me think through this for a moment|let me work through this step by step|ek minute[,]? mujhe sochne dijiye|एक मिनट[,]? मुझे सोचने दीजिए)$/.test(body)) return result(false, 'acknowledgment');
+  if (/^(?:kya (?:aap|tum) mujhe sun (?:rahe|pa rahe) (?:ho|hain)|kya samajh (?:aaya|aya)|क्या (?:आप|तुम) मुझे सुन (?:रहे|पा रहे) (?:हो|हैं)|क्या समझ आया)$/.test(body)) return result(false, 'acknowledgment');
+  if (/^(?:(?:kya|kaise|kyun|kyon|क्या|कैसे|क्यों)(?: (?:hai|hain|hoga|है|हैं|होगा))?)$/.test(body)) return result(false, 'incomplete');
+  if (incompleteQuestion(body)) return result(false, 'incomplete');
   const letters = body.match(/\p{L}/gu) || [];
-  if (letters.length < 2 && !/^(?:c(?:\+\+|#)?|r)$/.test(body)) return false;
-  if (/[?？]/.test(text)) return true;
-  return /^(?:(?:and|please)[,\s]+)*(?:what|why|how|when|where|which|who|whose|can|could|would|will|do|does|did|is|are|was|were|should|have|has|explain|describe|clarify|elaborate|design|implement|solve|compare|find|write|optimize|optimise|given|suppose|tell me|walk (?:me|us) through|talk (?:me|us) through|show (?:me|us)|give (?:me|us))\b/i.test(requestBody(body));
+  if (letters.length < 2 && !/^(?:c(?:\+\+|#)?|r)$/.test(body)) return result(false, 'statement');
+  const correction = /^(?:actually\b|correction\b|no[,\s]+(?:i (?:said|meant)|(?:the |a )?(?:subarray|substring|subsequence|array|input|output))|nahi[,\s]|nahi\b|नहीं[\s,])/i.test(body);
+  const followup = /^(?:(?:and|also|aur|ab)[,\s]+)*(?:(?:its |the )?(?:time|space|memory)(?: and (?:time|space|memory))?(?: complexity| usage)?|in (?:java|python|javascript|typescript|c\+\+|c#|go|rust)|(?:an? |another )?example|edge cases|test cases|pros and cons|advantages|disadvantages|tradeoffs|please continue|continue|walk through an? example|isi (?:solution|approach).+|इसी (?:समाधान|सॉल्यूशन).+)$/i.test(body);
+  if (correction || followup) return result(!!hasContext, hasContext ? (correction ? 'correction' : 'contextual-followup') : 'needs-context');
+  // These actions express complete tasks without an interrogative opening.
+  const action = /\b(?:return|find|calculate|compute|determine|identify|implement|design|solve|write|explain|describe|compare|optimi[sz]e)\s+\S+/i;
+  const setup = /^(?:given\b|suppose\b|you (?:are|have been) given\b|i have (?:an? |the )|we have (?:an? |the )|(?:ek |aapko |apko )?.*\b(?:array|graph|tree|list|input)\b.*\b(?:diya|diye|hai|hain)\b|आपको|एक .*(?:दिया|है))/i.test(body);
+  const directTask = /^(?:(?:please|and|then)[,\s]+)*(?:return|calculate|compute|determine|identify)\s+\S+/i.test(body)
+    || /^(?:your task is to|the task is to|you (?:need|have) to|we need to|we need)\s+\S+/i.test(body);
+  const hindiTask = /(?:\b(?:batao|bataiye|bataye|samjhao|samjhaiye|nikaalo|nikalo|nikaliye|likho)\b|\b(?:solve|implement|design|explain|return|calculate) karo\b|बताओ|बताइए|समझाओ|समझाइए|निकालो|निकालिए|लिखो|हल करो)/i.test(body);
+  const hindiQuestion = !/^(?:i know\b|mujhe pata hai\b|main (?:jaanta|janta|jaanti)\b|मुझे पता है|मैं जानता)/i.test(body)
+    && (/^(?:(?:ab|aur|toh|अच्छा|अब|और)[,\s]+)*(?:kya|kaise|kyun|kyon|kab|kaun|kahan|क्या|कैसे|क्यों|कब|कौन|कहाँ)\s+\S.+/i.test(body)
+      || /(?:\b(?:kya|kaise|kyun|kyon)\b.*\b(?:hai|hain|hoga|hogi|hota|hote|kare|karoge|karenge)|(?:^|\s)(?:क्या|कैसे|क्यों).*(?:है|हैं|होगा|होगी|होता|करोगे))$/i.test(body));
+  const setupAction = setup && action.test(body.replace(/^(?:given|suppose)\b/i, ''));
+  if (directTask || hindiTask || setupAction) return result(true, 'complete-task', 'task');
+  if (hindiQuestion) return result(true, 'question');
+  if (setup) return result(false, 'background');
+  if (/[?？]/.test(text)) return result(true, 'question');
+  if (/^(?:(?:and|please)[,\s]+)*(?:what|why|how|when|where|which|who|whose|can|could|would|will|do|does|did|is|are|was|were|should|have|has|explain|describe|clarify|elaborate|design|implement|solve|compare|find|write|optimize|optimise|tell me|walk (?:me|us) through|talk (?:me|us) through|show (?:me|us)|give (?:me|us))\b/i.test(requestBody(body))) return result(true, 'question');
+  return result(false, 'statement');
 }
+
+function looksLikeQuestion(value, options) { return classifyTurn(value, options).question; }
 
 class TurnAssembler {
   constructor({ onUpdate = () => {}, onTurn = () => {}, settleMs = 800, prefixMs = 6500,
-    now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
-    for (const callback of [onUpdate, onTurn, now, setTimer, clearTimer]) {
+    now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, hasContext = () => false } = {}) {
+    for (const callback of [onUpdate, onTurn, now, setTimer, clearTimer, hasContext]) {
       if (typeof callback !== 'function') throw new TypeError('Turn callbacks and clock functions must be functions.');
     }
     if (!Number.isFinite(settleMs) || settleMs < 0 || !Number.isFinite(prefixMs) || prefixMs < 0) {
@@ -77,6 +102,7 @@ class TurnAssembler {
     this.now = now;
     this.setTimer = setTimer;
     this.clearTimer = clearTimer;
+    this.hasContext = hasContext;
     this._states = new Map();
     this._seenFinals = new Map();
     this._counter = 0;
@@ -145,6 +171,17 @@ class TurnAssembler {
     this._arm(state, this.prefixMs);
   }
 
+  discardPending(source) {
+    if (typeof source === 'string') {
+      const state = this._states.get(source);
+      if (state) this._cancelTimer(state);
+      this._states.delete(source);
+    } else {
+      for (const state of this._states.values()) this._cancelTimer(state);
+      this._states.clear();
+    }
+  }
+
   reset(source) {
     if (typeof source === 'string') {
       const state = this._states.get(source);
@@ -175,20 +212,21 @@ class TurnAssembler {
       if (state.unfinished) {
         // A missing final must not cause an older fragment to be answered.
         // Retain its transcript but close it without an automatic question.
-        this._finish(state, false);
+        this._finish(state, { question: false, reason: 'incomplete-audio', kind: 'incomplete' });
       } else if (incompleteQuestion(state.text) && this.now() - state.latestAt < this.prefixMs) {
         this._arm(state, this.prefixMs);
       } else {
-        this._finish(state, !state.truncated && looksLikeQuestion(state.text));
+        this._finish(state, state.truncated ? { question: false, reason: 'too-long', kind: 'incomplete' }
+          : classifyTurn(state.text, { hasContext: !!this.hasContext(state.source) }));
       }
     }, remaining);
   }
 
-  _finish(state, question) {
+  _finish(state, decision) {
     this._cancelTimer(state);
     this._states.delete(state.source);
-    if (state.text) this.onTurn({ id: state.id, source: state.source, text: state.text, question });
+    if (state.text) this.onTurn({ id: state.id, source: state.source, text: state.text, ...decision });
   }
 }
 
-module.exports = { TurnAssembler, looksLikeQuestion };
+module.exports = { TurnAssembler, looksLikeQuestion, classifyTurn };

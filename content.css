@@ -83,3 +83,5 @@ button:focus-visible,input:focus-visible,main:focus-visible{outline:2px solid #a
 @keyframes soft-pulse{0%,100%{opacity:.55}50%{opacity:1}}
 @media(max-width:570px){.question-section{padding-left:20px;padding-right:20px}.answer-scroll{padding-left:20px;padding-right:20px}.message,.composer{margin-left:20px;margin-right:20px}.empty-state{padding-left:4px}.empty-state h1{font-size:25px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+
+.voice-command-status{flex:0 0 auto;margin:2px 26px 3px;color:#a9bfb2;font-size:11px;line-height:1.5;overflow-wrap:anywhere;max-height:48px;overflow:auto}.voice-command-status[data-status=error],.voice-command-status[data-status=blocked]{color:#dfbda1}

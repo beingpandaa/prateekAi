@@ -49,6 +49,7 @@ function harness(t, oauth) {
       listProviderModels: async () => { throw new Error('Unexpected non-plan catalog request.'); } },
     './speech.cjs': { SpeechSession: class { constructor() { throw new Error('Unexpected speech session.'); } } },
     './turns.cjs': require('./turns.cjs'),
+    './voice-fallback.cjs': require('./voice-fallback.cjs'),
     './profile.cjs': require('./profile.cjs'),
     './routing.cjs': require('./routing.cjs'),
     './oauth.cjs': {

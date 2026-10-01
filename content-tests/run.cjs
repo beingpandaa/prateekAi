@@ -3,7 +3,7 @@
 const { app, BrowserWindow, session } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
-const out = path.resolve(__dirname, '../../content-view-tests');
+const out = path.resolve(__dirname, '../../voice-content-tests');
 app.setPath('userData', path.join(out, 'profile'));
 const timeout = setTimeout(() => app.exit(2), 30000);
 app.whenReady().then(async () => {
@@ -37,6 +37,11 @@ app.whenReady().then(async () => {
     check('Expanded popup reserves at least 500px for answer reading', el('answerScroll').clientHeight>=500);
     check('Expanded popup gives answer at least 74 percent of height', el('answerScroll').clientHeight/innerHeight>=.74);
     contentTest.emit({type:'answer-done',id:40});
+    contentTest.emit({type:'settings-changed',settings:{voiceFallbackEnabled:true}});
+    contentTest.emit({type:'voice-command-status',status:'queued',message:'Waiting for the current answer. <img src=x>'});
+    check('Voice-command status is visible and rendered as text',!el('voiceCommandStatus').classList.contains('hidden')&&el('voiceCommandStatus').textContent.includes('Waiting')&&!el('voiceCommandStatus').querySelector('img'));
+    contentTest.emit({type:'settings-changed',settings:{voiceFallbackEnabled:false}});
+    check('Disabled voice fallback uses no popup reading space',el('voiceCommandStatus').classList.contains('hidden'));
     contentTest.emit({type:'question',text:'A follow-up heard after this answer'});
     contentTest.emit({type:'question-preview',text:'Another question is forming',pending:true});
     check('Incoming question never relabels a completed answer', el('currentQuestion').textContent==='Snapshot question');
@@ -92,21 +97,22 @@ app.whenReady().then(async () => {
     contentTest.emit({type:'session-stopped',reason:'Listening stopped.'});
     contentTest.emit({type:'session-reset'});draft('');
     contentTest.emit({type:'hotkey-answer'});await tick();
-    check('Answer shortcut opens input when no question is available',!el('composer').classList.contains('hidden') && contentTest.calls().asks.length===requestsBeforeExample);
+    check('Answer shortcut consults the authoritative pending question without repeating an old answer',contentTest.calls().pending.length===1&&contentTest.calls().pending[0].trigger==='hotkey'&&contentTest.calls().asks.length===requestsBeforeExample&&el('message').textContent.includes('No recent unanswered'));
     el('dismissComposer').click();contentTest.emit({type:'question',text:'Latest complete question'});
     contentTest.emit({type:'hotkey-answer'});contentTest.emit({type:'hotkey-answer'});
-    check('Answer shortcut uses the latest heard question and blocks duplicate submits',contentTest.calls().asks.length===requestsBeforeExample+1 && contentTest.calls().asks.at(-1).question==='Latest complete question');
+    check('Answer shortcut delegates pending submission once and blocks duplicates',contentTest.calls().pending.length===2&&contentTest.calls().asks.length===requestsBeforeExample);
     contentTest.emit({type:'answer-start',id:70,question:'Latest complete question',automatic:false});
+    contentTest.emit({type:'question',text:'Next pending question while the first answer streams'});
     contentTest.emit({type:'hotkey-answer'});
-    check('Answer shortcut cannot interrupt a generating answer',contentTest.calls().asks.length===requestsBeforeExample+1);
+    check('Answer shortcut queues through main while preserving the generating answer',contentTest.calls().pending.length===3&&contentTest.calls().cancel===1&&el('currentQuestion').textContent==='Latest complete question'&&el('answerScroll').getAttribute('aria-busy')==='true');
     contentTest.finish({type:'answer-done',id:70});await tick();
-    el('composeButton').click();draft('Typed question wins');contentTest.emit({type:'hotkey-answer'});
-    contentTest.emit({type:'answer-start',id:71,question:'Typed question wins',automatic:false});await tick();
-    check('Answer shortcut prefers the draft and clears it only after acceptance',contentTest.calls().asks.at(-1).question==='Typed question wins' && el('manualQuestion').value==='' && el('composer').classList.contains('hidden'));
+    el('composeButton').click();draft('Typed question stays manual');contentTest.emit({type:'hotkey-answer'});await tick();
+    check('Answer shortcut never sends a typed draft implicitly',contentTest.calls().pending.length===4&&contentTest.calls().asks.length===requestsBeforeExample&&el('manualQuestion').value==='Typed question stays manual');
+    el('askButton').click();contentTest.emit({type:'answer-start',id:71,question:'Typed question stays manual',automatic:false});await tick();
+    check('Typed Ask remains manual and clears only after acceptance',contentTest.calls().asks.at(-1).question==='Typed question stays manual'&&el('manualQuestion').value===''&&el('composer').classList.contains('hidden'));
     contentTest.finish({type:'answer-done',id:71});await tick();
     contentTest.emit({type:'session-reset'});contentTest.emit({type:'answer-start',id:72,question:'Previously answered question'});contentTest.emit({type:'answer-done',id:72});contentTest.emit({type:'hotkey-answer'});
-    check('Answer shortcut can reuse the answered question without a newer heard question',contentTest.calls().asks.at(-1).question==='Previously answered question');
-    contentTest.emit({type:'answer-start',id:73,question:'Previously answered question',automatic:false});contentTest.finish({type:'answer-done',id:73});await tick();
+    await tick();check('Answer shortcut cannot silently reuse a previously answered question',contentTest.calls().pending.length===5&&contentTest.calls().asks.at(-1).question==='Typed question stays manual'&&el('message').textContent.includes('No recent unanswered'));
     const grip=el('resizeHandle'),baseWidth=innerWidth,baseHeight=innerHeight;
     grip.focus();for(const key of ['ArrowRight','ArrowRight','ArrowDown'])grip.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true}));await tick();
     check('Accessible resize grip coalesces keyboard increments through IPC',contentTest.calls().resizes.length===1 && contentTest.calls().resizes[0].width===baseWidth+40 && contentTest.calls().resizes[0].height===baseHeight+20);
@@ -145,6 +151,19 @@ app.whenReady().then(async () => {
   })()`);
   await win.webContents.executeJavaScript('window.runContentSmokeTest()');
   fs.writeFileSync(path.join(out, 'content-small.png'), (await win.webContents.capturePage()).toPNG());
-  fs.writeFileSync(path.join(out, 'results.json'), JSON.stringify({ ok: true, count: checks.length + small.length, checks: [...checks, ...small], smoke, blockedRequests }, null, 2));
+  const hydrationWindow = new BrowserWindow({ width: 740, height: 660, show: false,
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } });
+  await hydrationWindow.loadFile(path.resolve(__dirname, '../content.html'));
+  const hydration = await hydrationWindow.webContents.executeJavaScript(`(async()=>{
+    const tick=()=>new Promise(resolve=>setTimeout(resolve,30));
+    contentTest.emit({type:'hotkey-answer',seq:2});
+    contentTest.resolveSnapshot({seq:3,live:false,answer:{id:null,question:'',text:'',state:'idle'},sources:{}});
+    await tick();contentTest.emit({type:'hotkey-answer',seq:2});await tick();
+    const passed=contentTest.calls().pending.length===1&&contentTest.calls().asks.length===0;
+    if(!passed)throw new Error('Snapshot dropped or duplicated buffered shortcut');
+    return {name:'A shortcut buffered before snapshot hydration runs once even below snapshot sequence',passed};
+  })()`);
+  hydrationWindow.destroy();
+  fs.writeFileSync(path.join(out, 'results.json'), JSON.stringify({ ok: true, count: checks.length + small.length + 1, checks: [...checks, ...small, hydration], smoke, blockedRequests }, null, 2));
   clearTimeout(timeout); app.exit(0);
 }).catch(error => { fs.mkdirSync(out, { recursive: true }); fs.writeFileSync(path.join(out, 'error.txt'), error.stack); clearTimeout(timeout); app.exit(1); });

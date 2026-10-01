@@ -9,6 +9,10 @@ let sessionMode = 'call', callMic = false, preferencesBusy = false;
 let nextQuestion = '', latestDetectedQuestion = '';
 let modelRefreshBusy = false, modelRefreshId = 0, modelCatalog = null;
 let selectedProvider = 'chatgpt', draftModels = {}, draftFastModels = {};
+let speechLanguage = 'en', voiceTestRevision = 0, voiceTestBusy = false, diagnosticsBusy = false;
+const VOICE_DEFAULTS = ['Give me a minute to think.', 'Let me think through this for a moment.', 'Let me work through this step by step.', 'Ek minute, mujhe sochne dijiye.'];
+const voicePhrases = () => $('voiceCommandPhrases').value.split(/\r?\n/).map(text => text.trim()).filter(Boolean);
+const defaultVoicePhrases = () => Array.isArray(config?.voiceCommandDefaults) ? config.voiceCommandDefaults : VOICE_DEFAULTS;
 const PROVIDERS = {
   chatgpt: { label: 'ChatGPT plan', model: 'gpt-5.6-sol', help: 'Use the supported ChatGPT connection with an eligible plan. Availability and usage limits depend on your account and workspace.' },
   openai: { label: 'OpenAI API', model: 'gpt-5.6-sol', help: 'Use a developer API key from OpenAI Platform. API billing is separate from your ChatGPT subscription.' },
@@ -71,11 +75,70 @@ function hasUnsavedSetup() {
     mode: selectedMode, depth: selectedDepth, context: $('context').value,
     roleTitle: $('roleTitle').value, roleDescription: $('roleDescription').value,
     autoAnswer: $('autoAnswer').checked, adaptiveModels: $('adaptiveModels').checked,
+    speechLanguage, voiceFallbackEnabled: $('voiceFallbackEnabled').checked,
+    voiceFreshnessMs: Number($('voiceFreshnessMs').value), voiceCooldownMs: Number($('voiceCooldownMs').value), voiceFinalizeMs: Number($('voiceFinalizeMs').value),
     maxMinutes: Number($('maxMinutes').value), maxAutoAnswers: Number($('maxAutoAnswers').value),
     questionPauseMs: Number($('questionPauseMs').value), incompletePauseMs: Number($('incompletePauseMs').value), answerTimeoutMs: Number($('answerTimeoutMs').value)
   };
-  const defaults = {fastModel:'',mode:'auto',depth:'auto',context:'',roleTitle:'',roleDescription:'',autoAnswer:false,adaptiveModels:true,questionPauseMs:800,incompletePauseMs:6500,answerTimeoutMs:75000};
-  return Object.entries(fields).some(([name,value]) => value !== (config[name] ?? defaults[name]));
+  const defaults = {fastModel:'',mode:'auto',depth:'auto',context:'',roleTitle:'',roleDescription:'',autoAnswer:false,adaptiveModels:true,questionPauseMs:800,incompletePauseMs:6500,answerTimeoutMs:75000,speechLanguage:'en',voiceFallbackEnabled:false,voiceFreshnessMs:90000,voiceCooldownMs:3000,voiceFinalizeMs:1500};
+  return Object.entries(fields).some(([name,value]) => value !== (config[name] ?? defaults[name]))
+    || JSON.stringify(voicePhrases()) !== JSON.stringify(config.voiceCommandPhrases ?? defaultVoicePhrases());
+}
+function renderSpeechLanguage() {
+  document.querySelectorAll('[data-speech-language]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.speechLanguage === speechLanguage)));
+}
+function renderVoiceSettings() {
+  const enabled = $('voiceFallbackEnabled').checked;
+  $('voiceFallbackFields').disabled = !enabled;
+  $('voiceFreshnessValue').textContent = `${Number($('voiceFreshnessMs').value) / 1000} s`;
+  $('voiceCooldownValue').textContent = `${Number($('voiceCooldownMs').value) / 1000} s`;
+  $('voiceFinalizeValue').textContent = `${Number($('voiceFinalizeMs').value) / 1000} s`;
+  renderVoiceStreamCost();
+}
+function renderVoiceStreamCost() {
+  const enabled = live || starting ? !!config?.voiceFallbackEnabled : $('voiceFallbackEnabled').checked;
+  $('voiceStreamCost').classList.toggle('hidden', !enabled);
+  $('voiceStreamCost').textContent = sessionMode === 'practice'
+    ? 'Voice fallback on · microphone practice uses one paid speech stream.'
+    : callMic
+      ? 'Voice fallback on · call audio + microphone use two paid speech streams. Microphone context is included.'
+      : 'Voice fallback on · call audio + microphone use two paid speech streams. The microphone is used for commands only.';
+}
+async function testVoiceCommand() {
+  if (voiceTestBusy || live || starting || savingSettings || !$('voiceFallbackEnabled').checked) return;
+  const text = $('voiceTestText').value.trim();
+  if (!text) { $('voiceTestResult').textContent = 'Type a phrase to test. No audio or AI request will be made.'; return; }
+  const revision = ++voiceTestRevision;
+  voiceTestBusy = true; $('testVoiceCommand').disabled = true;
+  try {
+    const result = await api.testVoiceCommand({ text, phrases: voicePhrases() });
+    if (revision !== voiceTestRevision) return;
+    $('voiceTestResult').textContent = result.message || (result.matched ? `Recognized command${result.phrase ? `: ${result.phrase}` : ''}. No answer was requested.` : 'Not a command. Try a saved phrase by itself.');
+  } catch (error) { if (revision === voiceTestRevision) $('voiceTestResult').textContent = error.message || 'The phrase could not be tested.'; }
+  finally { voiceTestBusy = false; $('testVoiceCommand').disabled = false; }
+}
+function renderDiagnostics(data) {
+  const list = $('diagnosticsEvents'); list.replaceChildren();
+  for (const item of Array.isArray(data?.events) ? data.events.slice(-80).reverse() : []) {
+    const row = document.createElement('li'), time = document.createElement('time');
+    const at = new Date(item.at);
+    time.textContent = Number.isNaN(at.getTime()) ? '' : at.toLocaleTimeString();
+    row.append(time, document.createTextNode(`${item.kind || 'Event'} · ${item.message || ''}`));
+    list.append(row);
+  }
+  $('diagnosticsMessage').textContent = data?.summary || (list.children.length ? `${list.children.length} recent local events. Newest first.` : 'No diagnostic events yet.');
+}
+async function loadDiagnostics(exportFile = false) {
+  if (diagnosticsBusy) return;
+  diagnosticsBusy = true; $('refreshDiagnostics').disabled = true; $('exportDiagnostics').disabled = true;
+  try {
+    if (exportFile) {
+      const result = await api.exportDiagnostics();
+      const message = result.message || (result.ok === false ? 'Diagnostics were not exported.' : 'Diagnostics saved.');
+      $('diagnosticsMessage').textContent = result.path && !message.includes(result.path) ? `${message} ${result.path}` : message;
+    } else renderDiagnostics(await api.diagnostics());
+  } catch (error) { $('diagnosticsMessage').textContent = error.message || 'Diagnostics could not be loaded.'; }
+  finally { diagnosticsBusy = false; $('refreshDiagnostics').disabled = false; $('exportDiagnostics').disabled = false; }
 }
 function requireSavedSetup() {
   if (!hasUnsavedSetup()) return true;
@@ -137,6 +200,7 @@ async function refreshModels(force = false) {
   finally { if (request === modelRefreshId) { modelRefreshBusy = false; $('refreshModels').disabled = false; $('refreshModels').textContent = 'Refresh models'; } }
 }
 function syncSessionControls() {
+  renderProfileWarning();
   const practice = sessionMode === 'practice';
   document.querySelectorAll('[data-session-mode]').forEach(button => {
     button.setAttribute('aria-pressed', String(button.dataset.sessionMode === sessionMode));
@@ -149,7 +213,11 @@ function syncSessionControls() {
   $('liveAutoAnswer').disabled = starting || preferencesBusy || savingSettings;
   $('listen').disabled = starting || preferencesBusy || savingSettings;
   $('openContent').disabled = starting || savingSettings;
-  syncConfigurationLock(); updateFlowHint();
+  syncConfigurationLock(); updateFlowHint(); renderVoiceStreamCost();
+}
+function renderProfileWarning() {
+  $('profileWarning').textContent = config?.profileError || '';
+  $('profileWarning').classList.toggle('hidden', !config?.profileError);
 }
 function updateFlowHint() {
   if (!config?.autoAnswer) $('flowHint').textContent = 'Auto-answer off · use Ask for a manual answer.';
@@ -252,7 +320,7 @@ async function startListening() {
     }
     sessionMode = config.sessionMode === 'practice' ? 'practice' : 'call';
     const practice = sessionMode === 'practice';
-    const microphone = practice || callMic;
+    const microphone = practice || callMic || !!config.voiceFallbackEnabled;
     nextQuestion = ''; latestDetectedQuestion = ''; syncSessionControls();
     setStatus('Connecting…');
     try { audioContext = new AudioContext({ sampleRate: 16000 }); } catch { audioContext = new AudioContext(); }
@@ -261,7 +329,7 @@ async function startListening() {
     if (epoch !== captureEpoch) return;
     await context.resume();
     if (epoch !== captureEpoch) return;
-    await api.start({ sampleRate: context.sampleRate, microphone });
+    await api.start({ sampleRate: context.sampleRate, microphone, includeMicContext: practice || callMic });
     if (epoch !== captureEpoch) return;
     $('transcript').replaceChildren(); $('interim').textContent = '';
     if (!practice) {
@@ -308,6 +376,13 @@ function applySettings(value) {
   $('questionPauseMs').value = value.questionPauseMs ?? 800;
   $('incompletePauseMs').value = value.incompletePauseMs ?? 6500;
   $('answerTimeoutMs').value = value.answerTimeoutMs ?? 75000;
+  speechLanguage = value.speechLanguage === 'multi' ? 'multi' : 'en'; renderSpeechLanguage();
+  $('voiceFallbackEnabled').checked = value.voiceFallbackEnabled === true;
+  $('voiceCommandPhrases').value = (value.voiceCommandPhrases ?? defaultVoicePhrases()).join('\n');
+  $('voiceFreshnessMs').value = value.voiceFreshnessMs ?? 90000;
+  $('voiceCooldownMs').value = value.voiceCooldownMs ?? 3000;
+  $('voiceFinalizeMs').value = value.voiceFinalizeMs ?? 1500;
+  renderVoiceSettings();
   renderTimingSettings();
   $('maxAutoAnswers').disabled = !value.autoAnswer;
   chooseProvider(provider, false); showConnectionStatus(value);
@@ -317,6 +392,7 @@ function applySettings(value) {
   document.querySelectorAll('[data-depth]').forEach(button => button.classList.toggle('selected', button.dataset.depth === selectedDepth));
 }
 function selectSetupTab(name) {
+  $('diagnosticsPanel').classList.toggle('hidden', name !== 'session');
   document.querySelector('.settings-card').dataset.activeTab = name;
   document.querySelectorAll('[data-setup-tab]').forEach(button => {
     const selected = button.dataset.setupTab === name;
@@ -337,6 +413,8 @@ async function saveSettings(clearKeys = false) {
     const value = await api.saveSettings({ ...credentials, answerProvider: selectedProvider, compatibleBaseUrl: $('compatibleBaseUrl').value,
       model: $('model').value, fastModel: $('fastModel').value, adaptiveModels: $('adaptiveModels').checked, mode: selectedMode, depth: selectedDepth, context: $('context').value, roleTitle: $('roleTitle').value, roleDescription: $('roleDescription').value, autoAnswer: $('autoAnswer').checked,
       maxMinutes: Number($('maxMinutes').value), maxAutoAnswers: Number($('maxAutoAnswers').value),
+      speechLanguage, voiceFallbackEnabled: $('voiceFallbackEnabled').checked, voiceCommandPhrases: voicePhrases(),
+      voiceFreshnessMs: Number($('voiceFreshnessMs').value), voiceCooldownMs: Number($('voiceCooldownMs').value), voiceFinalizeMs: Number($('voiceFinalizeMs').value),
       questionPauseMs: Number($('questionPauseMs').value), incompletePauseMs: Number($('incompletePauseMs').value), answerTimeoutMs: Number($('answerTimeoutMs').value), clearKeys });
     if (clearKeys) for (const name of ['openai', 'anthropic', 'gemini', 'compatible', 'deepgram']) $(name + 'Key').value = '';
     else { if (selectedProvider !== 'chatgpt') $(selectedProvider + 'Key').value = ''; $('deepgramKey').value = ''; }
@@ -356,7 +434,7 @@ api.onEvent(event => {
  if(event.type==='model-catalog') showModelCatalog(event);
  if(event.type==='session-preferences') applySessionPreferences(event.settings);
  if(event.type==='session-started') startedAt = event.startedAt || Date.now();
- if(event.type==='settings-changed') { config={...config,...event.settings}; applyAppearance(config.backgroundOpacity); applyTextSize(config.answerFontSize); }
+ if(event.type==='settings-changed') { config={...config,...event.settings}; applyAppearance(config.backgroundOpacity); applyTextSize(config.answerFontSize); renderProfileWarning(); }
  if(event.type==='session-reset') resetSessionView();
  if(event.type==='session-stopped') { answerBusy=false; releaseCapture(); setStatus(event.reason || 'Listening stopped'); }
  if(event.type==='speech-state') { $(event.source==='remote'?'remoteState':'micState').textContent=(event.source==='remote'?'Call audio: ':'Microphone: ')+event.state; if(event.state==='reconnecting') $('interim').textContent=''; }
@@ -368,7 +446,7 @@ api.onEvent(event => {
  if(event.type==='auth-complete') { applyConnectionUpdate(event.settings); refreshModels(); $('settingsMessage').textContent=selectedProvider===config.answerProvider?(event.message||'ChatGPT connected.'):'ChatGPT connected. Save setup to select it.'; }
 });
 $('listen').addEventListener('click', () => startListening().catch(error => notice(error.message)));
-$('includeMic').addEventListener('change', () => { if (sessionMode === 'call') callMic = $('includeMic').checked; });
+$('includeMic').addEventListener('change', () => { if (sessionMode === 'call') callMic = $('includeMic').checked; renderVoiceStreamCost(); });
 $('liveAutoAnswer').addEventListener('change', () => changeSessionPreferences({ autoAnswer: $('liveAutoAnswer').checked }));
 document.querySelectorAll('[data-session-mode]').forEach(button => button.addEventListener('click', () => changeSessionPreferences({ sessionMode: button.dataset.sessionMode })));
 $('save').addEventListener('click', () => saveSettings());
@@ -389,6 +467,16 @@ $('forgetKeys').addEventListener('click', () => saveSettings(true));
 $('minimize').addEventListener('click', () => api.minimize());
 $('close').addEventListener('click', () => api.close());
 $('autoAnswer').addEventListener('change', () => { $('maxAutoAnswers').disabled = !$('autoAnswer').checked; });
+$('voiceFallbackEnabled').addEventListener('change', renderVoiceSettings);
+for (const id of ['voiceFreshnessMs', 'voiceCooldownMs', 'voiceFinalizeMs']) $(id).addEventListener('input', renderVoiceSettings);
+$('restoreVoicePhrases').addEventListener('click', () => { $('voiceCommandPhrases').value = defaultVoicePhrases().join('\n'); voiceTestRevision++; $('voiceTestResult').textContent = 'Default phrases restored. Save setup to use them.'; });
+for (const id of ['voiceCommandPhrases', 'voiceTestText']) $(id).addEventListener('input', () => { voiceTestRevision++; $('voiceTestResult').textContent = 'Text test only · no microphone, transcription, or AI request.'; });
+$('testVoiceCommand').addEventListener('click', testVoiceCommand);
+$('voiceTestText').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); testVoiceCommand(); } });
+document.querySelectorAll('[data-speech-language]').forEach(button => button.addEventListener('click', () => { speechLanguage = button.dataset.speechLanguage; renderSpeechLanguage(); }));
+$('refreshDiagnostics').addEventListener('click', () => loadDiagnostics());
+$('exportDiagnostics').addEventListener('click', () => loadDiagnostics(true));
+$('diagnosticsDetails').addEventListener('toggle', () => { if ($('diagnosticsDetails').open) loadDiagnostics(); });
 $('backgroundOpacity').addEventListener('input', () => applyAppearance($('backgroundOpacity').value));
 $('backgroundOpacity').addEventListener('change', async () => {
   try { const opacity = Number($('backgroundOpacity').value); await api.setAppearance(opacity); if (config) config.backgroundOpacity = opacity; }

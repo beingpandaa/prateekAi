@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Synthetic answer-quality references. No live model results are included; this file is not an evaluation runner.",
+  "pauseVariantsSeconds": [0.3, 0.8, 1.4, 2, 4],
+  "liveRepetitionsRequired": 3,
+  "comparisonArms": ["manual-reference-main", "assembled-voice-main", "assembled-voice-adaptive"],
+  "goldenQuestions": [
+    {
+      "id": "Q01",
+      "domain": "dsa",
+      "question": "For [1,-1,5,-2,3], find the longest contiguous subarray with sum exactly 3. Negative values and zeros are allowed. Give length, inclusive zero-based indices, approach, and complexity.",
+      "expected": { "length": 4, "inclusiveIndices": [0, 3] },
+      "invariants": ["Use all supplied values including negative values.", "Initialize prefix sum zero at index minus one.", "For the prefix-map solution, retain the earliest index for each prefix sum.", "Expected hash-map time O(n); auxiliary space O(n)."],
+      "criticalFailures": ["Positive-only sliding window presented as correct for signed arrays.", "Wrong length or indices.", "Losing the maximum interval by overwriting the earliest prefix index."],
+      "followups": ["And space complexity?", "Why store the earliest index?"]
+    },
+    {
+      "id": "Q02",
+      "domain": "dsa",
+      "question": "For [3,3], target 6, return the original zero-based indices of two distinct elements.",
+      "expected": { "indicesUnordered": [0, 1] },
+      "invariants": ["Indices are distinct even when values are equal.", "Complement lookup must not reuse the current element.", "Expected hash-map time O(n); auxiliary space O(n)."],
+      "criticalFailures": ["Returning [0,0].", "Returning element values instead of indices."]
+    },
+    {
+      "id": "Q03",
+      "domain": "dsa",
+      "question": "Arrange 8 coins in complete staircase rows of 1, 2, 3 and so on. How many complete rows fit?",
+      "expected": { "completeRows": 3, "coinsUsed": 6, "coinsRemaining": 2 },
+      "invariants": ["Three rows require six coins; four require ten.", "If generalizing an arithmetic solution, account for integer precision/rounding; integer binary search is also valid."],
+      "criticalFailures": ["Returning four complete rows.", "Counting an incomplete row as complete."]
+    },
+    {
+      "id": "Q04",
+      "domain": "dsa",
+      "question": "How many ordered ways can I climb 8 stairs using steps of 1 or 2?",
+      "expected": { "ways": 34, "baseCases": { "f0": 1, "f1": 1 }, "recurrence": "f(n) = f(n-1) + f(n-2)" },
+      "invariants": ["Order matters.", "An iterative O(n)-time, O(1)-auxiliary-space solution is valid; other correct algorithms may pass with accurate complexity."],
+      "criticalFailures": ["Returning 21 due to wrong Fibonacci indexing.", "Treating order as irrelevant."]
+    },
+    {
+      "id": "Q05",
+      "domain": "dsa",
+      "question": "Find the first and last zero-based occurrence of 2 in [1,2,2,2,4] in logarithmic time.",
+      "expected": { "firstIndex": 1, "lastIndex": 3 },
+      "invariants": ["Use boundary searches with O(log n) time.", "Handle duplicate values without returning only an arbitrary match."],
+      "criticalFailures": ["Wrong boundary indices.", "A linear scan claimed to have logarithmic time."]
+    },
+    {
+      "id": "Q06",
+      "domain": "software-fundamentals",
+      "question": "A synchronous loop uses var i=0; i<3; i++ and schedules setTimeout(()=>console.log(i),0) each time. What prints? What changes with let?",
+      "expected": { "varOutput": [3, 3, 3], "letOutput": [0, 1, 2] },
+      "invariants": ["Callbacks run after the synchronous loop.", "var shares a binding; let provides a per-iteration binding."],
+      "criticalFailures": ["Reversing the outputs.", "Claiming zero-delay callbacks execute within the synchronous loop."],
+      "followups": ["Why does the second version behave differently?"]
+    },
+    {
+      "id": "Q07",
+      "domain": "system-design",
+      "question": "Design order creation with retries when the database may commit but the response times out.",
+      "expectedCriteria": ["Use a stable idempotency key.", "Make duplicate prevention/result recording durable and atomic with the relevant order creation boundary.", "Handle retries of the same request and conflicting payloads using the same key.", "State boundaries and additional handling required for downstream side effects."],
+      "criticalFailures": ["In-memory deduplication alone presented as sufficient after a crash.", "Unsupported end-to-end exactly-once guarantee."]
+    },
+    {
+      "id": "Q08",
+      "domain": "siebel",
+      "question": "A Siebel user signs in but cannot see a record. Release and custom configuration are unknown. Which exact server parameter should I change?",
+      "expectedCriteria": ["Ask for missing release/configuration/evidence before exact version-dependent advice.", "Distinguish successful sign-in from record visibility.", "Offer a bounded diagnostic approach without inventing a configuration fix."],
+      "criticalFailures": ["Invented parameter name/value.", "Guaranteed version-specific steps without evidence."]
+    },
+    {
+      "id": "Q09",
+      "domain": "security",
+      "question": "A valid signed API token lets a user change an invoice ID to one belonging to another tenant. Is signature validation enough?",
+      "expectedCriteria": ["Clearly state that signature validation alone is insufficient.", "Require server-side object and tenant authorization using trusted identity and ownership/permission checks."],
+      "criticalFailures": ["Treating a valid signature as sufficient object authorization.", "Treating unpredictable IDs or CORS as sufficient authorization."]
+    },
+    {
+      "id": "Q10",
+      "domain": "role-grounding",
+      "roleTitle": "Senior integration engineer",
+      "roleDescription": "Design event-driven integration systems and discuss tradeoffs.",
+      "candidateSummary": "Implemented Siebel workflows and REST integrations. Has not operated Kafka in production. All facts in this fixture are synthetic.",
+      "question": "Describe my Kafka production work and how I would design an event-driven order pipeline.",
+      "expectedCriteria": ["State the missing production Kafka experience.", "Ground actual experience in the supplied workflow/REST facts.", "Label the proposed Kafka design as hypothetical.", "Use role requirements to guide relevance/depth without turning them into past achievements."],
+      "criticalFailures": ["Invented Kafka work, scale, achievements, employers, or metrics."]
+    }
+  ],
+  "hinglishCases": [
+    {
+      "id": "H01",
+      "segments": ["Ek integer array diya hai: one, minus one, five, minus two, three.", "Negative numbers aur zero bhi allowed hain.", "Longest contiguous subarray ki length batao jiska sum three ho."],
+      "oracleId": "Q01"
+    },
+    {
+      "id": "H02",
+      "requiresContext": "H01",
+      "segments": ["Ab array zero, zero, zero hai, aur K zero hai. Longest subarray ki length aur indices batao."],
+      "expected": { "length": 3, "inclusiveIndices": [0, 2] },
+      "invariants": ["Keep the initial prefix sum zero at index minus one; do not overwrite it."]
+    },
+    {
+      "id": "H03",
+      "requiresContext": "H01 or H02",
+      "segments": ["Iski time aur space complexity?", "Same prefix sum dobara aaye toh earliest index kyun rakhte hain?"],
+      "expectedCriteria": ["Expected O(n) time and O(n) space with hash-map assumptions.", "For a fixed ending index, the earliest matching prefix maximizes interval length."]
+    }
+  ]
+}

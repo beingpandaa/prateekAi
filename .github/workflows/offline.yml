@@ -21,6 +21,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Backend regressions (mock network)
         run: pnpm test
+      - name: Isolated Windows profile compatibility
+        run: pnpm test:profile-compat
       - name: Configuration UI
         run: pnpm test:ui
       - name: Answer popup

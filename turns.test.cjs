@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { TurnAssembler, looksLikeQuestion } = require('./turns.cjs');
+const { TurnAssembler, looksLikeQuestion, classifyTurn } = require('./turns.cjs');
 
 class Clock {
   time = 0;
@@ -64,7 +64,7 @@ test('joins the user example across a two-second pause into one automatic questi
   clock.tick(799);
   assert.equal(turns.length, 0);
   clock.tick(1);
-  assert.deepEqual(turns, [{ id: updates[0].id, source: 'you', text: 'Can you explain me what are closures?', question: true }]);
+  assert.deepEqual(turns, [{ id: updates[0].id, source: 'you', text: 'Can you explain me what are closures?', question: true, reason: 'question', kind: 'question' }]);
 });
 
 test('every final restarts quiet settling, even without speechFinal', () => {
@@ -308,7 +308,7 @@ test('question detection accepts short technical questions and meaningful reques
     'And its disadvantages?', 'What about memory?', 'Can you show an example?', 'And in Java?',
     'Show me an example.', 'Talk me through the design.', 'What is Redis used for?', 'Who do you work with?',
     'What does CPU stand for?', 'What are you referring to?', 'Explain logical AND?', 'Explain bitwise OR?']) {
-    assert.equal(looksLikeQuestion(text), true, text);
+    assert.equal(looksLikeQuestion(text, { hasContext: true }), true, text);
   }
 });
 
@@ -354,4 +354,78 @@ test('custom timer settings preserve deterministic settling', () => {
   assert.equal(turns.length, 0);
   clock.tick(1);
   assert.equal(turns.length, 1);
+});
+
+test('statement-form DSA objectives and Hinglish instructions do not need question punctuation', () => {
+  for (const text of [
+    'You are given an array of integers. Return the length of the longest subarray whose sum is K.',
+    'Given an array including negative numbers, find the longest contiguous subarray with sum K.',
+    'Return the length, not the count, of matching subarrays.',
+    'We need to find the longest contiguous subarray summing to K.',
+    'Your task is to implement a least recently used cache.',
+    'Ek integer array diya hai. Negative numbers bhi allowed hain. Longest contiguous subarray ki length nikaalo.',
+    'Array zero zero zero hai. K zero hai. Zero based start aur end indices batao.',
+    'एक array दिया है। Negative numbers भी allowed हैं। Longest contiguous subarray की length निकालो।',
+    'Closure kya hota hai', 'Kya binary search ke liye sorted array chahiye', 'इस solution की complexity क्या है', 'क्या binary search को sorted input चाहिए',
+    'New question: how would you design an API rate limiter?'
+  ]) assert.equal(classifyTurn(text).question, true, text);
+});
+
+test('background-only setup and communication checks never trigger technical answers', () => {
+  for (const text of ['Given an array of integers.', 'Suppose negative numbers are allowed.', 'You are given an integer array.',
+    'Ek integer array diya hai.', 'एक array दिया है।', 'Did you get it?', 'Can you hear me?', 'Does that make sense?',
+    'Am I audible?', 'Are you there?', 'Samajh aaya?', 'समझ आया।', 'Kya aap mujhe sun rahe hain', 'क्या समझ आया',
+    'Mujhe pata hai closure kya hota hai', 'kya hai']) {
+    assert.equal(classifyTurn(text).question, false, text);
+  }
+  assert.equal(classifyTurn('Did you get it?').reason, 'acknowledgment');
+  assert.equal(classifyTurn('Given an array of integers.').reason, 'background');
+});
+
+test('elliptical followups and corrections require previous task context', () => {
+  for (const text of ['Time complexity.', 'And space?', 'And in Java.', 'Please continue.', 'Walk through an example.',
+    'Actually, negative numbers are allowed.', 'No, I said contiguous subarray, not subsequence.',
+    'Ab isi solution ki time aur space complexity batao.']) {
+    assert.equal(classifyTurn(text).question, false, text);
+    assert.equal(classifyTurn(text).reason, 'needs-context');
+    assert.equal(classifyTurn(text, { hasContext: true }).question, true, text);
+  }
+});
+
+test('long problem setup settles without a request; final objective and contextual followup are accepted', () => {
+  const { assembler, clock, turns } = setup({ hasContext: () => true });
+  assembler.push(final('You are given an integer array.', 0)); clock.tick(1400);
+  assembler.push(final('Negative numbers and zero are allowed.', 2)); clock.tick(1400);
+  assembler.push(final('Return the longest contiguous subarray length with sum K.', 4)); clock.tick(1400);
+  assembler.push(final('Did you get it?', 6)); clock.tick(1400);
+  assembler.push(final('And in Java.', 8)); clock.tick(1400);
+  assert.deepEqual(turns.map(turn => [turn.question, turn.reason]), [
+    [false, 'background'], [false, 'statement'], [true, 'complete-task'], [false, 'acknowledgment'], [true, 'contextual-followup']
+  ]);
+});
+
+test('explicit submission discards pending timers while preserving packet dedupe and turn identity counters', () => {
+  const { assembler, clock, turns, updates } = setup();
+  const remote = final('Explain closures.', 0, 1, 'remote');
+  assembler.push(remote);
+  assembler.push(final('I am listening.', 0, 1, 'you'));
+  const raced = [...clock.timers.values()][0].fn;
+  const previousId = updates[0].id;
+  assembler.discardPending('remote'); raced();
+  assembler.push(remote); clock.tick(800);
+  assert.deepEqual(turns.map(item => item.source), ['you']);
+  assembler.push(final('What is binary search?', 2, 1, 'remote')); clock.tick(800);
+  assert.equal(turns.length, 2); assert.notEqual(turns[1].id, previousId);
+  assembler.push(final('Explain graphs.', 4, 1, 'remote'));
+  assembler.discardPending(); clock.tick(6500); assert.equal(turns.length, 2);
+});
+
+test('approved pause phrases are coordination globally while actual task requests stay actionable', () => {
+  for (const text of ['Give me a minute to think.', 'Gimme a minute to think!', 'Let me think through this for a moment.',
+    'Let me work through this step by step.', 'Ek minute, mujhe sochne dijiye.', 'एक मिनट, मुझे सोचने दीजिए।']) {
+    const result = classifyTurn(text, { hasContext: true });
+    assert.equal(result.question, false, text); assert.equal(result.reason, 'acknowledgment');
+  }
+  assert.equal(classifyTurn('Give me an example of closures.').question, true);
+  assert.equal(classifyTurn('Give me a minute-by-minute breakdown of the algorithm.').question, true);
 });
