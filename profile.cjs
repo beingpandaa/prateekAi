@@ -82,7 +82,8 @@ function createProfileStore({ directory, safeStorage, fileSystem = fs }) {
     };
     for (const name of SECRET_NAMES) {
       const value = secrets[name];
-      if (value !== undefined && typeof value !== 'string') throw failure('Invalid credential supplied for saving.', 'PROFILE_INVALID');
+      if (value === undefined) continue; // Omitted fields are not a request to erase a saved key.
+      if (typeof value !== 'string') throw failure('Invalid credential supplied for saving.', 'PROFILE_INVALID');
       if (value) keys[name] = encrypt(value); else delete keys[name];
     }
     const chatgpt = chatgptProfile ? encrypt(JSON.stringify(chatgptProfile)) : null;
