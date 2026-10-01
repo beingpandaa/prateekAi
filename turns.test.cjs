@@ -260,7 +260,9 @@ test('empty or abandoned interim-only speech never produces a fabricated final t
   assembler.push(interim('can you'));
   clock.tick(6500);
   assert.equal(updates.length, 0);
-  assert.equal(turns.length, 0);
+  assert.equal(turns.length, 1, 'Notify the owner that unresolved ASR text expired, without inventing finalized text');
+  assert.equal(turns[0].text, ''); assert.equal(turns[0].question, false);
+  assert.equal(turns[0].reason, 'incomplete-audio'); assert.equal(turns[0].hadInterimText, true);
   assert.equal(clock.timers.size, 0);
 });
 
@@ -428,4 +430,25 @@ test('approved pause phrases are coordination globally while actual task request
   }
   assert.equal(classifyTurn('Give me an example of closures.').question, true);
   assert.equal(classifyTurn('Give me a minute-by-minute breakdown of the algorithm.').question, true);
+});
+
+test('orphan VAD-only expiry notifies once and is distinguished from missing ASR text', () => {
+  const { assembler, clock, turns, updates } = setup();
+  assembler.push({ source: 'you', text: '', speechStarted: true, start: 2 });
+  clock.tick(6499); assert.equal(turns.length, 0);
+  clock.tick(1); assert.equal(turns.length, 1); assert.equal(updates.length, 0);
+  assert.equal(turns[0].text, ''); assert.equal(turns[0].reason, 'incomplete-audio'); assert.equal(turns[0].hadInterimText, false);
+  clock.tick(6500); assert.equal(turns.length, 1);
+  assembler.push(final('What is binary search?', 10, 2)); clock.tick(800);
+  assert.equal(turns.length, 2); assert.equal(turns[1].question, true); assert.notEqual(turns[1].id, turns[0].id);
+});
+
+test('a completed final clears the missing-interim marker before a subsequent VAD-only pause', () => {
+  const { assembler, clock, turns } = setup();
+  assembler.push(interim('Explain closures.', 0, 1));
+  assembler.push(final('Explain closures.', 0, 1));
+  clock.tick(700); assembler.push({ source: 'you', text: '', speechStarted: true, start: 2 });
+  clock.tick(6500);
+  assert.equal(turns[0].reason, 'incomplete-audio'); assert.equal(turns[0].hadInterimText, false);
+  assert.equal(turns[0].text, 'Explain closures.');
 });

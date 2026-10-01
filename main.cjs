@@ -5,7 +5,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { streamProviderAnswer, listProviderModels, validateBaseUrl } = require('./provider-adapters.cjs');
 const { SpeechSession } = require('./speech.cjs');
-const { TurnAssembler, looksLikeQuestion, classifyTurn } = require('./turns.cjs');
+const { TurnAssembler, looksLikeQuestion, classifyTurn, isFreshQuestionStart } = require('./turns.cjs');
 const { DEFAULT_VOICE_PHRASES, normalizeVoicePhrases, detectVoiceCommand, VoiceCommandMatcher, PendingQuestionBuffer } = require('./voice-fallback.cjs');
 const { resolveProfileDirectory, createProfileStore } = require('./profile.cjs');
 const { selectRoute } = require('./routing.cjs');
@@ -47,6 +47,7 @@ const normalizedQuestion = text => text.toLowerCase().replace(/\s+/g, ' ').trim(
 let shutdown = false, captureAllowed = false;
 let workspaceBounds;
 let eventSequence = 0, contentVisibilityGeneration = 0, hotkeyAnswerPending = false, answerSnapshot = { id: null, question: '', text: '', state: 'idle' }, pendingQuestion = '';
+let questionStatus = null;
 let sourceStates = { remote: 'off', you: 'off' };
 const profileStore = createProfileStore({ directory: dataDir, safeStorage, fileSystem: fs });
 let profileError = '';
@@ -55,18 +56,22 @@ function send(type, detail = {}) {
   const event = { ...detail, type, seq: ++eventSequence };
   if (type === 'session-reset') {
     answerSnapshot = { id: null, question: '', text: '', state: 'idle' };
-    sourceStates = { remote: 'off', you: 'off' }; pendingQuestion = '';
-  } else if (type === 'answer-start') answerSnapshot = { ...detail, text: '', state: 'generating', message: '', firstTextMs: null, elapsedMs: null };
+    sourceStates = { remote: 'off', you: 'off' }; pendingQuestion = ''; questionStatus = null;
+  } else if (type === 'answer-start') {
+    answerSnapshot = { ...detail, text: '', state: 'generating', message: '', firstTextMs: null, elapsedMs: null };
+    if (!detail.automatic || questionStatus?.questionId === detail.questionId) questionStatus = null;
+  }
   else if (type === 'answer-delta' && detail.id === answerSnapshot.id && typeof detail.text === 'string') answerSnapshot.text = (answerSnapshot.text + detail.text).slice(0, 256 * 1024);
   else if (['answer-phase', 'answer-timing'].includes(type) && detail.id === answerSnapshot.id) answerSnapshot = { ...answerSnapshot, ...detail };
   else if (type === 'answer-done' && detail.id === answerSnapshot.id) answerSnapshot = { ...answerSnapshot, ...detail, state: 'done' };
   else if (type === 'answer-error' && detail.id === answerSnapshot.id) answerSnapshot = { ...answerSnapshot, ...detail, state: 'error' };
   else if (type === 'answer-cancelled' && answerSnapshot.state === 'generating') answerSnapshot = { ...answerSnapshot, state: 'cancelled' };
   else if (type === 'speech-state' && ['remote', 'you'].includes(detail.source)) sourceStates[detail.source] = detail.state;
-  else if (type === 'question-preview') pendingQuestion = detail.pending ? trim(detail.text, 8000) : '';
-  else if (type === 'question') pendingQuestion = '';
+  else if (type === 'question-preview') { pendingQuestion = detail.pending ? trim(detail.text, 8000) : ''; if (detail.pending) questionStatus = null; }
+  else if (type === 'question-status') questionStatus = { ...detail };
+  else if (type === 'question') { pendingQuestion = ''; questionStatus = null; }
   else if (type === 'session-stopped') {
-    sourceStates = { remote: 'off', you: 'off' }; pendingQuestion = '';
+    sourceStates = { remote: 'off', you: 'off' }; pendingQuestion = ''; questionStatus = null;
     if (answerSnapshot.state === 'generating') answerSnapshot = { ...answerSnapshot, state: 'cancelled', message: detail.reason || '' };
   }
   for (const target of [win, contentWin]) {
@@ -90,7 +95,7 @@ const ensureSender = (event, method) => {
 const handle = (name, fn) => ipcMain.handle(name, (event, ...args) => { ensureSender(event, name); return fn(...args); });
 function contentState() {
   return { seq: eventSequence, settings: publicSettings(), live, startedAt, answers, question: lastQuestion, pendingQuestion,
-    answer: { ...answerSnapshot }, sources: { ...sourceStates }, voiceCommandStatus };
+    answer: { ...answerSnapshot }, sources: { ...sourceStates }, voiceCommandStatus, questionStatus };
 }
 function safeError(error) {
   let text = String(error?.message || error || 'Request failed.');
@@ -372,6 +377,22 @@ function rememberTurn(turn) {
   const classification = classifyTurn(turn.text, { hasContext: !!lastQuestion });
   pendingBuffer.observe({ ...turn, reason: turn.reason || classification.reason });
 }
+function reportHeldQuestion(snapshot, reason, message) {
+  const messages = {
+    background: 'Captured the setup. Waiting for the task.',
+    statement: 'Captured speech; the question end is uncertain.',
+    incomplete: 'Question may be unfinished. Keep speaking, or answer the captured text.',
+    'needs-context': 'Repeat the full question so I have the context.',
+    'incomplete-audio': 'Some speech was not finalized. Please repeat the full question.',
+    'audio-gap': 'Audio was interrupted. Please repeat the full question.',
+    'too-long': 'Question is too long. Shorten it or enter it manually.',
+    expired: 'The captured question expired. Please ask it again.'
+  };
+  send('question-status', { status: snapshot.canRecover && !message ? 'held' : 'blocked', reason,
+    message: message || messages[reason] || 'The captured question could not be submitted.',
+    text: snapshot.text || '', questionId: snapshot.id, revision: snapshot.revision,
+    canSubmit: !!snapshot.canRecover && !message && !sourceNeedsFresh.has(questionSource), expiresAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt + settings.voiceFreshnessMs : null });
+}
 function beginTurns(id) {
   pendingBuffer = new PendingQuestionBuffer({ sessionId: id, source: questionSource, maxAgeMs: settings.voiceFreshnessMs, now: () => Date.now() });
   pendingBuffer.reset({ sessionId: id, source: questionSource });
@@ -381,18 +402,34 @@ function beginTurns(id) {
     onUpdate: turn => { rememberTurn(turn); publishTurn(id, turn, true); },
     onTurn: turn => {
       if (!live || sessionId !== id) return;
-      if (turn.reason === 'incomplete-audio') audioUnfinished.delete(turn.source);
+      if (turn.reason === 'incomplete-audio') {
+        audioUnfinished.delete(turn.source);
+        if (!turn.text) {
+          if (turn.hadInterimText) markAudioGap(turn.source, 'incomplete-audio');
+          recordDiagnostic('question-decision', turn.hadInterimText ? 'Speech text never finalized; repeat the full question.' : 'Expired speech-start without transcript words.', { decision: turn.hadInterimText ? 'incomplete' : 'ignored', source: turn.source, reason: turn.hadInterimText ? 'incomplete-audio' : 'empty-speech-start' });
+          return;
+        }
+        if (turn.hadInterimText) sourceNeedsFresh.add(turn.source);
+      }
       rememberTurn(turn); publishTurn(id, turn, false);
       if (turn.source !== questionSource) return;
       send('question-preview', { text: '', turnId: turn.id, pending: false });
       const snapshot = pendingBuffer.snapshot();
+      if (audioUnfinished.has(questionSource)) {
+        recordDiagnostic('question-decision', 'Unresolved speech text: repeat the full question.', { decision: 'incomplete', reason: 'incomplete-audio', questionId: snapshot.id });
+        markAudioGap(questionSource, 'incomplete-audio');
+        return;
+      }
       const classification = classifyTurn(snapshot.text, { hasContext: !!lastQuestion });
       if (['acknowledgment', 'incomplete-audio', 'too-long'].includes(turn.reason) || !classification.question || !snapshot.canRecover) {
-        recordDiagnostic('question-decision', 'Question held: ' + (turn.reason || classification.reason), { decision: 'held', reason: turn.reason || classification.reason, questionId: snapshot.id }); return;
+        const reason = turn.reason || classification.reason;
+        recordDiagnostic('question-decision', 'Question held: ' + reason, { decision: 'held', reason, questionId: snapshot.id });
+        if (reason !== 'acknowledgment' && snapshot.status !== 'consumed') reportHeldQuestion(snapshot, reason);
+        return;
       }
-      if (settings.autoAnswer && !audioUnfinished.has(questionSource)) {
+      if (settings.autoAnswer) {
         const result = queueSnapshot(snapshot, 'auto');
-        if (!result.ok) { recordDiagnostic('question-decision', result.message, { decision: 'blocked', trigger: 'auto' }); send('notice', { message: result.message }); }
+        if (!result.ok) { recordDiagnostic('question-decision', result.message, { decision: 'blocked', trigger: 'auto' }); reportHeldQuestion(snapshot, 'submission-blocked', result.message); send('notice', { message: result.message }); }
       } else { lastQuestion = snapshot.text; send('question', { text: snapshot.text, turnId: snapshot.id, source: questionSource }); lastQuestionTiming = { question: snapshot.text, readyAt: Date.now() }; recordDiagnostic('question-decision', 'Pending question ready', { decision: 'ready', questionId: snapshot.id }); }
     } });
 }
@@ -407,6 +444,7 @@ function trackFinalState(result) {
   } else if (result.isFinal && result.text) {
     const end = Number.isFinite(result.start) ? result.start + (result.duration || 0) : null;
     spans = spans.filter(span => span.start !== null && end !== null
+      && !(!span.hasText && end > span.start + 0.001)
       && !(result.start <= span.start + 0.02 && end > span.start + 0.001));
   }
   if (spans.length) audioUnfinished.set(result.source, { spans, hasText: spans.some(span => span.hasText) });
@@ -420,19 +458,25 @@ function markAudioGap(source, reason = 'audio-gap') {
   for (const notify of [...finalWaiters]) notify(false);
   send('question-preview', { text: '', pending: false });
   recordDiagnostic('question-decision', 'Audio gap: repeat the full question or enter it manually.', { decision: 'incomplete', reason });
+  reportHeldQuestion(pendingBuffer?.snapshot() || { canRecover: false }, reason);
 }
 function forwardTranscript(id, result) {
   if (!live || id !== sessionId) return;
   if (result.source === 'you' && activeSessionMode === 'call' && !includeMicContext) return;
+  if (result.isFinal && result.text) recordDiagnostic('transcript-final', 'Finalized question audio', { source: result.source, text: result.text, audioStart: result.start, audioDuration: result.duration });
   if (sourceNeedsFresh.has(result.source)) {
     // Continuations such as 'Return its length' cannot repair an unknown gap.
-    const freshStart = /^(?:(?:new|next) (?:question|problem)[\s:,.]+)?(?:what|why|how|explain|describe|design|implement|write|given|you are given|can you|could you|ek |aapko |आपको|एक )/i.test(result.text.trim());
-    if (!result.isFinal || !freshStart) return;
+    if (!result.isFinal || !isFreshQuestionStart(result.text)) {
+      if (result.isFinal && result.text) {
+        recordDiagnostic('question-decision', 'Still waiting for a full question after incomplete audio.', { decision: 'held', reason: 'needs-fresh-question', source: result.source, text: result.text });
+        reportHeldQuestion({ ...pendingBuffer.snapshot(), text: result.text, canRecover: false }, 'incomplete-audio');
+      }
+      return;
+    }
     sourceNeedsFresh.delete(result.source);
   }
   trackFinalState(result);
   if (!result.isFinal && result.text) send('transcript', result);
-  if (result.isFinal && result.text) recordDiagnostic('transcript-final', 'Finalized question audio', { source: result.source, text: result.text, audioStart: result.start, audioDuration: result.duration });
   turnAssembler?.push(result);
   for (const notify of [...finalWaiters]) notify();
 }
@@ -512,7 +556,7 @@ async function ask(input = {}) {
   recentAcceptedQuestions.set(normalizedQuestion(question), Date.now());
   if (input.automatic) { autoCount++; submittedQuestions.set(input.candidate.key, 'generating'); }
   send('answer-start', { id, question, automatic: !!input.automatic, answers, autoCount,
-    provider: selectedProvider, model: route.model, routeKind: route.kind, trigger: input.candidate?.trigger || 'manual', settleMs, queueWaitMs });
+    questionId: input.candidate?.turnId, provider: selectedProvider, model: route.model, routeKind: route.kind, trigger: input.candidate?.trigger || 'manual', settleMs, queueWaitMs });
   recordDiagnostic('answer-start', 'Request sent', { trigger: input.candidate?.trigger || 'manual', provider: selectedProvider, model: route.model, settleMs, queueWaitMs });
   try {
     let key = secrets[selectedProvider] || '';

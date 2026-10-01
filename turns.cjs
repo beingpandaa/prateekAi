@@ -85,6 +85,14 @@ function classifyTurn(value, { hasContext = false } = {}) {
 }
 
 function looksLikeQuestion(value, options) { return classifyTurn(value, options).question; }
+function isFreshQuestionStart(value) {
+  const body = questionBody(value).replace(/^(?:new|next) (?:question|problem)[\s:,.]+/, '');
+  // A repeat after missing audio must stand on its own. Reuse ordinary question
+  // recognition (including fillers and Hindi), but reject dependent continuations.
+  if (/^(?:(?:and|also|then|aur|ab)[,\s]+)*(?:(?:return|include|use|show)\b|(?:find|calculate|determine|explain|describe|solve)\s+(?:it|its|this|that|these|those)\b|(?:what|how|why) (?:about|is it|is that|is this|does it|does that)\b)/i.test(body)) return false;
+  const classification = classifyTurn(body, { hasContext: false });
+  return classification.question || classification.reason === 'background';
+}
 
 class TurnAssembler {
   constructor({ onUpdate = () => {}, onTurn = () => {}, settleMs = 800, prefixMs = 6500,
@@ -132,7 +140,7 @@ class TurnAssembler {
     if (!state) {
       state = { id: `${source}:${++this._counter}`, source, text: '', timer: null,
         timerVersion: 0, latestAt: this.now(), unfinished: false, interimStart: null,
-        interimKey: null, startedKey: null, truncated: false };
+        interimKey: null, startedKey: null, hadInterimText: false, truncated: false };
       this._states.set(source, state);
     }
 
@@ -148,6 +156,7 @@ class TurnAssembler {
         state.interimStart = null;
         state.interimKey = null;
         state.startedKey = null;
+        state.hadInterimText = false;
       }
       this.onUpdate({ id: state.id, source, text: state.text, pending: true });
       // onUpdate may clear the session synchronously.
@@ -160,6 +169,7 @@ class TurnAssembler {
       const key = JSON.stringify([start, duration, text]);
       if (state.unfinished && state.interimKey === key) return;
       state.interimKey = key;
+      state.hadInterimText = true;
     } else {
       const key = start === null ? 'untimed' : String(start);
       if (state.unfinished && state.startedKey === key) return;
@@ -225,8 +235,12 @@ class TurnAssembler {
   _finish(state, decision) {
     this._cancelTimer(state);
     this._states.delete(state.source);
-    if (state.text) this.onTurn({ id: state.id, source: state.source, text: state.text, ...decision });
+    // Even an interim-only state must notify its owner on expiry; otherwise a
+    // separate unresolved-audio guard can block later complete questions forever.
+    // This is a lifecycle event, not a fabricated final transcript.
+    if (state.text || decision.reason === 'incomplete-audio') this.onTurn({ id: state.id, source: state.source, text: state.text, ...decision,
+      ...(decision.reason === 'incomplete-audio' ? { hadInterimText: state.hadInterimText } : {}) });
   }
 }
 
-module.exports = { TurnAssembler, looksLikeQuestion, classifyTurn };
+module.exports = { TurnAssembler, looksLikeQuestion, classifyTurn, isFreshQuestionStart };

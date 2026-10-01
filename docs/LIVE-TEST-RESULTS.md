@@ -24,6 +24,16 @@ Do not fill missing durations with zero, mark a skipped test passed, or replace 
 
 One parallel cross-layer run initially failed an overly tight lower-bound check against a diagnostic timestamp (780 ms instead of at least 790 ms). The test now measures final transcript injection to answer-start with a monotonic clock, retaining a strict upper bound below 1500 ms. The corrected isolated run passed at 806 ms. This is a single synthetic-flow measurement, not a live 95th-percentile result. No production timing setting was changed to obtain it.
 
+## Version 0.6.1 regression update
+
+A reported transition from “Finishing question” back to “Listening” without a new answer prompted deterministic replay. Replay reproduced an orphan speech-start or unfinalized interim span blocking later complete questions. The recording alone does not establish that this was its exact cause.
+
+The fix expires empty speech-start state, keeps genuinely missing text blocked, and allows a fresh full question to recover. Completion rejections now show a reason and captured excerpt in the answer window; recoverable text has an explicit submission button. The previous answer remains paired with its original question.
+
+Backend regression results: **409 passed, 0 failed**. Configuration results: **54 passed**. Answer-window results: **55 passed**. Cross-layer results: **55 passed**, using 17 mocked answer requests and 3 fake speech connections. No real cloud requests or hardware audio capture were used. These checks cover both Auto-answer settings, second-question recovery, missing-final safeguards, held-state restoration after popup reload, and English/Hinglish fresh-question detection. Live ASR accuracy, provider timing and answer quality still require the live protocol above.
+
+The 0.6.1 portable folder was built and its Windows product/version metadata verified. **Packaged launch check: BLOCKED** by a Windows Application Control policy on the local test PC. The executable is unsigned. No security setting was changed and the launch block was not bypassed. The earlier 0.6.0 packaged pass does not establish that 0.6.1 can launch; distribution signing/trust remains unresolved. The source-driven UI and cross-layer results above do not replace this packaged launch gate.
+
 ## Run record template
 
 Copy one record per case/configuration/repetition into a private local test record. Commit only a reviewed, redacted summary; never commit keys, candidate profiles, recordings, or raw diagnostics.

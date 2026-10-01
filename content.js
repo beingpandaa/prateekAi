@@ -93,7 +93,7 @@ function updateStatus() {
     label = state.answer.text ? 'Answering' : state.answer.phase === 'refreshing-auth' ? 'Refreshing connection' : 'Preparing answer';
   } else if (state.live) {
     kind = 'live';
-    label = state.sources[source] === 'reconnecting' ? 'Reconnecting audio' : nextQuestion ? 'Finishing question' : state.settings.autoAnswer ? 'Listening · Auto' : 'Listening · Manual';
+    label = state.sources[source] === 'reconnecting' ? 'Reconnecting audio' : nextQuestion ? 'Finishing question' : state.questionStatus ? (state.questionStatus.status === 'held' ? 'Question held · Listening' : 'Question needs attention') : state.settings.autoAnswer ? 'Listening · Auto' : 'Listening · Manual';
   } else if (stopped) label = 'Stopped';
   if (state.answer.state === 'error') { label = state.live ? 'Answer failed · Listening' : 'Answer failed'; kind = 'error'; }
   else if (state.answer.state === 'cancelled' && !state.live) label = 'Stopped';
@@ -115,6 +115,14 @@ function updateStatus() {
   $('voiceCommandStatus').classList.toggle('hidden', !voiceVisible);
   $('voiceCommandStatus').dataset.status = voice?.status || 'ready';
   $('voiceCommandStatus').textContent = voice?.message || 'Voice fallback ready · say a saved command to answer the pending question.';
+  const recovery = state.questionStatus;
+  const recoveryVisible = !!recovery && state.live && !previewMode;
+  const expired = Number.isFinite(recovery?.expiresAt) && Date.now() >= recovery.expiresAt;
+  $('questionRecovery').classList.toggle('hidden', !recoveryVisible);
+  $('questionRecoveryMessage').textContent = expired ? 'The captured question expired. Please ask it again.' : recovery?.message || '';
+  $('questionRecoveryText').textContent = recovery?.text || '';
+  $('answerCaptured').classList.toggle('hidden', !recovery?.canSubmit || expired);
+  $('answerCaptured').disabled = sending || !recoveryVisible || !recovery?.canSubmit || expired;
 }
 function renderQuestion() {
   const question = state.answer.question || (state.answer.id === null ? state.question : '');
@@ -150,7 +158,8 @@ function renderAnswer() {
     ? state.settings.autoAnswer ? 'Listening for your next question.\nAnswers will appear automatically.' : 'Listening is on.\nTurn on Auto-answer in Setup, or type a question.'
     : 'Start listening from Setup.\nTurn on Auto-answer for answers as you talk.';
   const failure = answer.state === 'error' ? answer.message : answer.state === 'cancelled' && hasAnswer ? 'Answer stopped. This partial answer may be incomplete.' : '';
-  message(noticeText && failure && noticeText !== failure ? `${noticeText} ${failure}` : noticeText || failure, !failure);
+  const notice = state.questionStatus?.message === noticeText ? '' : noticeText;
+  message(notice && failure && notice !== failure ? `${notice} ${failure}` : notice || failure, !failure);
   renderQuestion(); updateStatus();
 }
 function scheduleAnswer() {
@@ -173,7 +182,7 @@ function showMenu() {
 function reset() {
   state.question = ''; state.answer = idleAnswer(); state.sources = {}; nextQuestion = ''; noticeText = ''; submission = null; sending = false;
   previewMode = false; renderedId = null; renderedText = null; questionExpanded = false; $('answerScroll').scrollTop = 0;
-  state.voiceCommandStatus = null;
+  state.voiceCommandStatus = null; state.questionStatus = null;
 }
 function applyEvent(event) {
   // Commands are not represented by the state snapshot. Replay one buffered
@@ -189,18 +198,20 @@ function applyEvent(event) {
   if (event.type === 'session-reset') { reset(); flushAnswer(); return; }
   if (event.type === 'session-started') { state.live = true; state.startedAt = event.startedAt || Date.now(); stopped = false; noticeText = ''; renderAnswer(); return; }
   if (event.type === 'session-stopped') {
-    state.live = false; stopped = true; nextQuestion = '';
+    state.live = false; stopped = true; nextQuestion = ''; state.questionStatus = null;
     if (busy()) state.answer = { ...state.answer, state: 'cancelled' };
     if (event.reason && event.reason !== 'Listening stopped.') noticeText = event.reason;
     sending = false; submission = null; flushAnswer(); return;
   }
   if (event.type === 'speech-state') { state.sources[event.source] = event.state; updateStatus(); return; }
   if (event.type === 'voice-command-status') { state.voiceCommandStatus = { status: event.status, message: event.message }; updateStatus(); return; }
+  if (event.type === 'question-status') { state.questionStatus = { ...event }; updateStatus(); return; }
   if (event.type === 'notice') { noticeText = event.message || ''; renderAnswer(); return; }
-  if (event.type === 'question-preview') { nextQuestion = event.pending ? event.text || '' : ''; updateStatus(); return; }
-  if (event.type === 'question') { state.question = event.text || ''; if (!state.answer.question) renderQuestion(); return; }
+  if (event.type === 'question-preview') { nextQuestion = event.pending ? event.text || '' : ''; if (event.pending) state.questionStatus = null; updateStatus(); return; }
+  if (event.type === 'question') { state.question = event.text || ''; state.questionStatus = null; updateStatus(); if (!state.answer.question) renderQuestion(); return; }
   if (event.type === 'answer-start') {
     previewMode = false;
+    if (!event.automatic || state.questionStatus?.questionId === event.questionId) state.questionStatus = null;
     if (!event.automatic && submission?.question === event.question) {
       if (draftRevision === submission.revision && $('manualQuestion').value === submission.draft) { $('manualQuestion').value = ''; draftRevision++; setComposer(false); }
       submission = null;
@@ -301,6 +312,7 @@ $('emptyExample').addEventListener('click', showExample);
 $('showExample').addEventListener('click', showExample);
 $('hideContent').addEventListener('click', () => { closeMenu(); perform(() => api.hideContent()); });
 $('stopListening').addEventListener('click', () => { closeMenu(); perform(() => api.stop()); });
+$('answerCaptured').addEventListener('click', () => submitPending());
 $('smallerText').addEventListener('click', () => textSize(-1));
 $('largerText').addEventListener('click', () => textSize(1));
 $('backgroundOpacity').addEventListener('input', () => applySettings({ backgroundOpacity: Number($('backgroundOpacity').value) }));

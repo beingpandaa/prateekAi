@@ -357,7 +357,7 @@ test('the automatic cap is rechecked when queued work is dispatched', async t =>
   h.requests[0].finish(); await settle();
   assert.equal(h.requests.length, 1);
   assert.equal(h.state().autoCount, 1);
-  assert.equal(h.events.filter(event => /limit reached/.test(event.message || '')).length, 1);
+  assert.equal(h.events.filter(event => event.type === 'notice' && /limit reached/.test(event.message || '')).length, 1);
 });
 
 test('missing answer credentials disable Auto visibly once and do not consume its cap', async t => {
@@ -1507,4 +1507,90 @@ test('a ninety-second segmented DSA problem retains early constraints without ea
   assert.equal(h.requests.length, 0);
   mic.transcript('Return the length of the longest contiguous subarray whose sum is K.'); await h.tick(801);
   assert.equal(h.requests.length, 1); assert.match(h.requests[0].options.question, /negative numbers and zeros/);
+});
+
+test('expiry: orphan SpeechStarted between answers cannot silently block the next finalized question', async t => {
+  const h = harness(t); await h.start('practice', true); const mic = h.connection('you');
+  mic.transcript('What is a closure?', {start:0,duration:1}); await h.tick(1000);
+  assert.equal(h.requests.length, 1);
+  mic.transcript('', {isFinal:false,speechFinal:false,speechStarted:true,start:2,duration:0}); await h.tick(7000);
+  mic.transcript('What is binary search?', {start:10,duration:2}); await h.tick(1000);
+  assert.equal(h.requests.length, 2, 'An expired VAD hint is not unresolved question text');
+  assert.equal(h.requests[1].options.question, 'What is binary search?');
+});
+
+test('held finalized speech has a persistent visible recovery state and shares hotkey dedupe', async t => {
+  const h = harness(t); await h.start('practice', true);
+  h.connection('you').transcript('A bounded buffer using multiple producers and consumers.', {start:0,duration:3}); await h.tick(1000);
+  const state = h.invoke('content:state');
+  assert.equal(state.questionStatus.status, 'held'); assert.equal(state.questionStatus.canSubmit, true);
+  assert.match(state.questionStatus.text, /bounded buffer/); assert.match(state.questionStatus.message, /uncertain/);
+  assert.equal(h.requests.length, 0);
+  assert.equal((await h.invoke('answer:submit-pending')).ok, true); await settle();
+  assert.equal(h.requests.length, 1); assert.equal(h.invoke('content:state').questionStatus, null);
+  assert.equal((await h.invoke('answer:submit-pending')).ok, false); assert.equal(h.requests.length, 1);
+});
+
+test('incomplete capture explains its blocker and a full Find request recovers automatic answering', async t => {
+  const h = harness(t); await h.start('practice', true); const mic = h.connection('you');
+  mic.transcript('Given an integer array.', {start:0,duration:1});
+  mic.transcript('With a missing constraint', {isFinal:false,start:2,duration:1}); await h.tick(7000);
+  const status = h.invoke('content:state').questionStatus;
+  assert.equal(status.status, 'blocked'); assert.equal(status.canSubmit, false); assert.match(status.message, /repeat the full question/);
+  mic.transcript('Find the longest subarray with sum K in an integer array that may contain negatives.', {start:10,duration:4}); await h.tick(1000);
+  assert.equal(h.requests.length, 1); assert.equal(h.invoke('content:state').questionStatus, null);
+});
+
+test('unresolved text recovery also works with Auto off and an explicit keyboard submission', async t => {
+  const h = harness(t); await h.start('practice', false); const mic = h.connection('you');
+  mic.transcript('An unfinished constraint', {isFinal:false,start:0,duration:1});
+  mic.transcript('What is binary search?', {start:3,duration:2}); await h.tick(1000);
+  assert.equal(h.invoke('content:state').questionStatus.canSubmit, false);
+  assert.equal((await h.invoke('answer:submit-pending')).ok, false);
+  mic.transcript('What is binary search?', {start:7,duration:2}); await h.tick(1000);
+  assert.equal((await h.invoke('answer:submit-pending')).ok, true); await settle();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.question, 'What is binary search?');
+});
+
+for (const question of ['Okay, what is a closure?', 'Tell me about binary search.', 'Kya binary search ke liye sorted array chahiye?']) {
+  test(`fresh recovery uses ordinary supported question phrasing: ${question}`, async t => {
+    const h = harness(t); await h.start('practice'); const mic = h.connection('you');
+    mic.transcript('An unfinished constraint', {isFinal:false,start:0,duration:1}); await h.tick(7000);
+    mic.transcript('Return its length.', {start:8,duration:1}); await h.tick(1000);
+    assert.equal(h.requests.length, 0);
+    assert.ok(h.invoke('diagnostics:get').events.some(event => event.kind === 'transcript-final' && event.text === 'Return its length.'));
+    mic.transcript(question, {start:10,duration:2}); await h.tick(1000);
+    assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.question, question);
+  });
+}
+
+test('expiry: abandoned interim-only speech becomes incomplete and a fresh full question answers afterward', async t => {
+  const h = harness(t); await h.start('practice', true); const mic = h.connection('you');
+  mic.transcript('What is a closure?', {start:0,duration:1}); await h.tick(1000);
+  mic.transcript('Can you', {isFinal:false,speechFinal:false,start:2,duration:0.4}); await h.tick(7000);
+  assert.equal(h.requests.length, 1, 'Abandoned interim text must not trigger a fabricated answer');
+  mic.transcript('What is binary search?', {start:10,duration:2}); await h.tick(1000);
+  assert.equal(h.requests.length, 2); assert.equal(h.requests[1].options.question, 'What is binary search?');
+});
+
+test('expiry: a new valid final clears earlier VAD-only hints without waiting for their timer', async t => {
+  const h = harness(t); await h.start('practice', true); const mic = h.connection('you');
+  mic.transcript('What is a closure?', {start:0,duration:1}); await h.tick(1000);
+  mic.transcript('', {isFinal:false,speechFinal:false,speechStarted:true,start:2,duration:0}); await h.tick(500);
+  mic.transcript('What is binary search?', {start:3,duration:2}); await h.tick(1000);
+  assert.equal(h.requests.length, 2, 'VAD metadata alone cannot suppress a completed technical question');
+  assert.equal(h.requests[1].options.question, 'What is binary search?');
+});
+
+test('expiry: newer unrelated final must not silently discard an unresolved text-bearing span', async t => {
+  const h = harness(t); await h.start('practice', true); const mic = h.connection('you');
+  mic.transcript('What is a closure?', {start:0,duration:1}); await h.tick(1000);
+  mic.transcript('But include the condition that', {isFinal:false,speechFinal:false,start:2,duration:1}); await h.tick(500);
+  mic.transcript('What is binary search?', {start:4,duration:2}); await h.tick(1000);
+  assert.equal(h.requests.length, 1, 'Missing ASR text needs an explicit incomplete outcome, unlike a VAD-only hint');
+  const pending = h.invoke('answer:submit-pending'); await settle(); await h.tick(1500);
+  assert.equal((await pending).ok, false); assert.equal(h.requests.length, 1);
+  mic.transcript('What is binary search?', {start:8,duration:2}); await h.tick(1000);
+  assert.equal(h.requests.length, 2, 'Repeating the full question after the incomplete outcome must recover');
+  assert.equal(h.requests[1].options.question, 'What is binary search?');
 });
