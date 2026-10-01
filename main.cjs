@@ -860,7 +860,7 @@ async function createContentWindow() {
   if (shutdown || !win || win.isDestroyed()) throw new Error('The configuration window has closed.');
   const area = screen.getDisplayMatching(win.getBounds()).workArea;
   const width = Math.min(740, area.width), height = Math.min(660, area.height);
-  const target = new BrowserWindow({ width, height, minWidth: Math.min(520, area.width), minHeight: Math.min(420, area.height),
+  const target = new BrowserWindow({ icon: path.join(__dirname, 'assets', 'prateekAi.ico'), width, height, minWidth: Math.min(520, area.width), minHeight: Math.min(420, area.height),
     x: Math.max(area.x, area.x + area.width - width - 24), y: Math.max(area.y, Math.min(area.y + 72, area.y + area.height - height)),
     resizable: true, maximizable: false, show: false, frame: false, transparent: true, backgroundColor: '#00000000',
     alwaysOnTop: !smoke && !captureTest, skipTaskbar: true,
@@ -887,7 +887,7 @@ async function createContentWindow() {
 async function createWindow() {
   Menu.setApplicationMenu(null);
   const area = screen.getPrimaryDisplay().workArea;
-  win = new BrowserWindow({ width: Math.min(1000, area.width), height: Math.min(760, area.height), minWidth: Math.min(780, area.width), minHeight: Math.min(600, area.height), resizable: true, maximizable: false,
+  win = new BrowserWindow({ icon: path.join(__dirname, 'assets', 'prateekAi.ico'), width: Math.min(1000, area.width), height: Math.min(760, area.height), minWidth: Math.min(780, area.width), minHeight: Math.min(600, area.height), resizable: true, maximizable: false,
     show: false, frame: false, transparent: false, backgroundColor: '#0b1013', alwaysOnTop: false, skipTaskbar: false,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false,
       sandbox: true, webSecurity: true, spellcheck: false, devTools: false, backgroundThrottling: false } });
