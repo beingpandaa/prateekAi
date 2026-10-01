@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const APP_FILES = Object.freeze(['main.cjs', 'preload.cjs', 'profile.cjs', 'voice-fallback.cjs', 'providers.cjs', 'provider-adapters.cjs', 'routing.cjs', 'speech.cjs', 'turns.cjs', 'oauth.cjs', 'index.html', 'style.css', 'renderer.js', 'content.html', 'content.js', 'content.css', 'pcm-worklet.js', 'assets/prateekAi.ico', 'assets/prateekAi.png']);
+const APP_FILES = Object.freeze(['main.cjs', 'preload.cjs', 'profile.cjs', 'audio-finality.cjs', 'voice-fallback.cjs', 'providers.cjs', 'provider-adapters.cjs', 'routing.cjs', 'speech.cjs', 'turns.cjs', 'oauth.cjs', 'index.html', 'style.css', 'renderer.js', 'content.html', 'content.js', 'content.css', 'pcm-worklet.js', 'assets/prateekAi.ico', 'assets/prateekAi.png']);
 const RUNTIME_FILES = Object.freeze(['chrome_100_percent.pak', 'chrome_200_percent.pak', 'd3dcompiler_47.dll', 'dxcompiler.dll', 'dxil.dll', 'electron.exe', 'ffmpeg.dll', 'icudtl.dat', 'libEGL.dll', 'libGLESv2.dll', 'LICENSE', 'LICENSES.chromium.html', 'resources.pak', 'snapshot_blob.bin', 'v8_context_snapshot.bin', 'vk_swiftshader.dll', 'vk_swiftshader_icd.json', 'vulkan-1.dll']);
 function destinationFor(destination) {
   const resolved = path.resolve(destination), relative = path.relative(__dirname, resolved);

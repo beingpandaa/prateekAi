@@ -26,6 +26,7 @@ flowchart LR
 | `renderer.js`, `pcm-worklet.js` | Configuration UI and browser audio capture; sends PCM through the preload bridge. |
 | `preload.cjs` | Exposes a narrow IPC API. Main validates sender identity, page URL, and each window's allowed operations. |
 | `speech.cjs` | Bounded audio streaming, speech connection state, finalization, and transcription events. |
+| `audio-finality.cjs` | Tracks finalized audio intervals and unfinished tails separately for each source/connection timeline. |
 | `turns.cjs` | Combines speech segments and classifies tasks, questions, incomplete fragments, acknowledgments, corrections, and contextual follow-ups. |
 | `voice-fallback.cjs` | Matches optional phrases and retains a source/session-scoped pending question. |
 | `routing.cjs` | Chooses a response route locally using question shape, context, user settings, and the authenticated model catalog. |
@@ -45,6 +46,10 @@ Loopback captures computer output, including unrelated music or videos. A source
 ## A question survives transcript segmentation
 
 An ASR final segment is not necessarily a complete question. “Can you explain” and “what closures are?” can be finalized separately. The turn assembler tracks source, audio timing, deduplication, and unfinished speech, then applies configurable settling rules.
+
+Finalization covers audio intervals. A final result can end earlier than the preceding interim result, leaving a trailing constraint unfinished; this is documented in [Deepgram's interim-results example](https://developers.deepgram.com/docs/using-interim-results). The shared `AudioFinality` tracker subtracts only the covered interval. An explicit empty final Results packet can retract interim words within its own valid interval. UtteranceEnd cannot do so. A late interim wholly within an already finalized range is ignored defensively. Missing or invalid timestamps never acquire invented start-zero coverage; timestamp rounding has a 1 ms tolerance.
+
+Pending-state clearing preserves finalized interval history, while a transport gap or session reset starts a new timeline. During recovery, new interims still establish unfinished coverage even before a fresh complete question is accepted. Dependent final clauses after a gap are rejected as question text but retain their audio-coverage information. This prevents a repeated question from submitting before its later constraint. Both finalized history and unfinished spans are bounded; overflow blocks submission and requests a complete repeat.
 
 The pending buffer retains relevant question text independently of the latest transcript row. It is identified by session, source, ID, and revision. Background setup may be followed by an action or constraints. Acknowledgments such as “Did you get it?” do not become replacement technical questions. Explicitly new topics start a new problem; contextual fragments depend on prior question context.
 
@@ -88,5 +93,7 @@ Setup and answers are separate windows. Opening Setup does not stop audio; hidin
 The profile resolver preserves an existing legacy profile, its encryption context, and OAuth identities. API keys and the ChatGPT account record are encrypted; role/background preferences are ordinary saved settings. A failed read/decryption prevents saving, and unexpected external modifications block a stale write. See [packaging and profile compatibility](../PACKAGING.md).
 
 Session diagnostics are bounded in memory and exported locally only when requested. They include decisions, timing information, connection/command states, and recognized question text. They do not contain raw audio or credentials. Exports may still contain confidential conversation content; they are excluded from the repository and releases.
+
+Schema version 2 includes an allowlisted settings snapshot, Auto-answer changes, and speech-progress metadata (event type, source, covered interval, unfinished intervals, and interim character count). Interim words are not copied into these progress events. A disabled Auto-answer setting and an incomplete-audio blocker have different decision reasons. Old exports lack these fields and cannot retrospectively establish which interim/VAD event caused a stall.
 
 No live provider access is required to run the mocked unit/flow tests. Real Windows encryption tests use synthetic credentials in isolated profiles. Neither class of test establishes cloud ASR accuracy, real model correctness, acoustic echo handling, or Meet receiver visibility; those results belong in [LIVE-TEST-RESULTS.md](LIVE-TEST-RESULTS.md).

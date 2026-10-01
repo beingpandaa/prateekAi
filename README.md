@@ -46,6 +46,8 @@ The app requests screen-capture exclusion through Windows/Electron. **There is n
 
 If needed, enable **voice fallback** in Setup and use a configured phrase such as “Give me a minute to think.” The phrase asks the app to submit the retained question; it is not itself the question. The feature is off by default. Read the [voice test matrix](docs/VOICE-TEST-MATRIX.md) for source restrictions, incomplete-audio behavior, and the required validation cases.
 
+If automatic completion holds captured speech, the answer window shows the reason and a short excerpt. **Answer captured question** uses the same pending-question submission path as the keyboard shortcut. When transcript text is missing, the app asks for the full question again instead of submitting partial input. A stray speech-start signal without words expires without blocking the next question.
+
 Diagnostics include recognized question text and processing decisions. They exclude credentials and raw audio, but may still contain sensitive conversation content. Review exports before sharing them.
 
 ## Run from source

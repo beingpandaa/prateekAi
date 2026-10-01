@@ -35,6 +35,19 @@ A pause does not announce future constraints. If a genuinely complete question i
 
 Use the pause variants on V03, V04, V06, V07, V08, and V10. Run missing-final and duplicate-event cases through deterministic injection as well as available live analogues; ordinary microphone testing cannot guarantee a particular provider event sequence.
 
+### Audio interval regression probes
+
+These injected protocol cases run without microphones or paid services. Repeat at both 800/6500 ms and 700/3000 ms completed/unfinished holds. Observe natural live segmentation separately; do not claim a synthetic packet ordering was seen in a recording without evidence.
+
+| Case | Stimulus | Required result |
+|---|---|---|
+| I01 | Final question over seconds 4–6, followed by a late interim wholly inside 4–6; also replay an earlier question's interim. | No reopened wait or duplicate answer. The next question still answers. |
+| I02 | Final question followed by interim “um” over seconds 6–6.4, then empty final Results covering 6–7. | Retracted words clear; answer the finalized question once. |
+| I03 | Interim question plus negative-number constraint over seconds 4–9; final question only over 4–6; then final constraint over 6–9. | No request for the prefix; exactly one request containing both question and constraint after the tail finalizes. |
+| I04 | As I03, but send UtteranceEnd, an unrelated empty Results interval, or an empty final with invalid timestamps while withholding the tail. | None may clear the missing constraint. Show incomplete capture instead of submitting a partial problem. |
+| I05 | Expire missing interim text, send a dependent continuation, then repeat I03 as a fresh full question. | Reject the dependent continuation, retain the repeated question's interim tail, and submit only the complete new question. |
+| I06 | Final interval ends at 8.9999998 for an interim ending at 9; compare with a genuine 2 ms uncovered tail. | Tolerate float32 rounding within 1 ms; preserve the larger unfinished tail. |
+
 ## H01–H03: Hinglish and contextual reasoning
 
 Select English + Hindi. Repeat with Latin-script and Devanagari ASR output where obtainable; do not assume identical transcripts from the two speech-language settings.

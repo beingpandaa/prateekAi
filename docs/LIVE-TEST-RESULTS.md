@@ -24,6 +24,26 @@ Do not fill missing durations with zero, mark a skipped test passed, or replace 
 
 One parallel cross-layer run initially failed an overly tight lower-bound check against a diagnostic timestamp (780 ms instead of at least 790 ms). The test now measures final transcript injection to answer-start with a monotonic clock, retaining a strict upper bound below 1500 ms. The corrected isolated run passed at 806 ms. This is a single synthetic-flow measurement, not a live 95th-percentile result. No production timing setting was changed to obtain it.
 
+## Version 0.6.1 regression update
+
+A reported transition from “Finishing question” back to “Listening” without a new answer prompted deterministic replay. Replay reproduced an orphan speech-start or unfinalized interim span blocking later complete questions. The recording alone does not establish that this was its exact cause.
+
+The fix expires empty speech-start state, keeps genuinely missing text blocked, and allows a fresh full question to recover. Completion rejections now show a reason and captured excerpt in the answer window; recoverable text has an explicit submission button. The previous answer remains paired with its original question.
+
+Backend regression results: **409 passed, 0 failed**. Configuration results: **54 passed**. Answer-window results: **55 passed**. Cross-layer results: **55 passed**, using 17 mocked answer requests and 3 fake speech connections. No real cloud requests or hardware audio capture were used. These checks cover both Auto-answer settings, second-question recovery, missing-final safeguards, held-state restoration after popup reload, and English/Hinglish fresh-question detection. Live ASR accuracy, provider timing and answer quality still require the live protocol above.
+
+The 0.6.1 portable folder was built and its Windows product/version metadata verified. **Packaged launch check: BLOCKED** by a Windows Application Control policy on the local test PC. The executable is unsigned. No security setting was changed and the launch block was not bypassed. The earlier 0.6.0 packaged pass does not establish that 0.6.1 can launch; distribution signing/trust remains unresolved. The source-driven UI and cross-layer results above do not replace this packaged launch gate.
+
+## Follow-up source validation — 0.6.2 (2026-10-01)
+
+Offline regressions reproduce and address four audio-state failures: late interims reopening finalized audio, empty final Results not clearing retracted words, partial finals dropping trailing constraints, and repeated questions bypassing tail protection after an incomplete-audio recovery. Coverage includes both 800/6500 ms and 700/3000 ms pause/unfinished settings, consecutive questions, session restart, malformed timestamps, and float32 timestamp rounding. Diagnostics distinguish manual mode from missing final audio and retain the decision-time settings needed for the next live investigation.
+
+The backend suite passed **449 tests, 0 failed**. The production cross-layer suite passed **58 checks**, using 19 mocked answer requests and 3 fake speech connections, with zero real cloud requests or hardware audio capture. New wire-level cases pass partial Results and UtteranceEnd through the actual SpeechSession parser and verify the complete constraint reaches the answer request. Council review also replayed recovery against retained expired content and confirmed no stale or duplicate submission. These are deterministic source tests, not evidence of real ASR accuracy or live model quality.
+
+Version 0.6.2 was subsequently packaged into a fresh portable folder from source commit `73305483f521b3536559ef3247d4b552c0c4d38c`. All 20 application-asset hashes matched the manifest, including the audio-finality module. Its packaged Setup and answer-window smoke checks passed with an isolated profile and exit code 0. A normal launch then opened the updated app with the existing compatible profile; listening remained stopped and no live transcription or answer test was started.
+
+The earlier 0.6.1 Windows Application Control block remains part of the historical record. The unmodified 0.6.2 build launched while Smart App Control remained enabled; no security policy, certificate trust, or executable fallback was changed. The reason for the differing Windows trust decisions is unknown. This establishes launch on this PC only: the build remains unsigned, other PCs may block it, and live acceptance and distribution signing remain open gates.
+
 ## Run record template
 
 Copy one record per case/configuration/repetition into a private local test record. Commit only a reviewed, redacted summary; never commit keys, candidate profiles, recordings, or raw diagnostics.

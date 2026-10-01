@@ -85,3 +85,6 @@ button:focus-visible,input:focus-visible,main:focus-visible{outline:2px solid #a
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 
 .voice-command-status{flex:0 0 auto;margin:2px 26px 3px;color:#a9bfb2;font-size:11px;line-height:1.5;overflow-wrap:anywhere;max-height:48px;overflow:auto}.voice-command-status[data-status=error],.voice-command-status[data-status=blocked]{color:#dfbda1}
+.question-recovery{flex:0 0 auto;margin:6px 26px;padding:9px 12px;border-left:2px solid #b99c74;border-radius:4px;background:#bd9b7010;font-size:13px;line-height:1.45;max-height:140px;overflow:auto}
+.question-recovery p{margin:0;color:#e1c5a3}.recovery-text{margin-top:5px;color:#bfcac4;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+.question-recovery .text-button{margin-top:7px;font-size:12px}

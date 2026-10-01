@@ -90,9 +90,9 @@ test('retains source labels, separates final text from empty end-of-turn markers
   ws.result({ type: 'Results', channel: { alternatives: [{ transcript: 'How does this work?' }] }, is_final: true, speech_final: true, start: 1, duration: 1.4 });
   ws.result({ type: 'UtteranceEnd', last_word_end: 2.4 });
   assert.deepEqual(transcripts, [
-    { source: 'remote', text: 'How does', isFinal: false, speechFinal: false, start: 1, duration: 0.5 },
-    { source: 'remote', text: 'How does this work?', isFinal: true, speechFinal: true, start: 1, duration: 1.4 },
-    { source: 'remote', text: '', isFinal: true, speechFinal: true, start: 2.4, duration: 0 }
+    { eventType: 'Results', fromFinalize: false, source: 'remote', text: 'How does', isFinal: false, speechFinal: false, start: 1, duration: 0.5 },
+    { eventType: 'Results', fromFinalize: false, source: 'remote', text: 'How does this work?', isFinal: true, speechFinal: true, start: 1, duration: 1.4 },
+    { eventType: 'UtteranceEnd', source: 'remote', text: '', isFinal: true, speechFinal: true, start: 2.4, duration: 0 }
   ]);
 });
 
@@ -121,7 +121,17 @@ test('forwards speech resumption immediately without inventing transcript text',
   const { session, sockets, transcripts } = harness(t);
   const started = session.start(); sockets[0].open(); await started;
   sockets[0].result({ type: 'SpeechStarted', channel: [0, 1], timestamp: 9.54 });
-  assert.deepEqual(transcripts, [{ source: 'remote', text: '', isFinal: false, speechFinal: false, speechStarted: true, start: 9.54, duration: 0 }]);
+  assert.deepEqual(transcripts, [{ eventType: 'SpeechStarted', source: 'remote', text: '', isFinal: false, speechFinal: false, speechStarted: true, start: 9.54, duration: 0 }]);
+});
+
+test('empty finalized Results preserve audio coverage independently of speech-final and utterance markers', async t => {
+  const {session,sockets,transcripts}=harness(t); const start=session.start(); sockets[0].open(); await start;
+  sockets[0].result({type:'Results',is_final:true,speech_final:false,from_finalize:true,start:6,duration:1,channel:{alternatives:[{transcript:''}]}});
+  sockets[0].result({type:'UtteranceEnd',last_word_end:7});
+  assert.equal(transcripts.length,2);
+  assert.equal(transcripts[0].eventType,'Results'); assert.equal(transcripts[0].isFinal,true);
+  assert.equal(transcripts[0].speechFinal,false); assert.equal(transcripts[0].fromFinalize,true);
+  assert.equal(transcripts[0].duration,1); assert.equal(transcripts[1].eventType,'UtteranceEnd'); assert.equal(transcripts[1].duration,0);
 });
 
 test('handles socket backpressure without busy-looping or an unbounded queue', async (t) => {
@@ -300,4 +310,16 @@ test('Finalize cannot claim to flush a disconnected or backlogged stream', async
   h.sockets[0].bufferedAmount = 300000;
   h.session.sendAudio(Buffer.from([0,0])); assert.equal(h.session.finalize(), false);
   h.sockets[0].bufferedAmount = 0;
+});
+
+test('invalid provider timestamps cannot invent finalized audio coverage', async t => {
+  const h=harness(t); const starting=h.session.start(); h.sockets[0].open(); await starting;
+  for (const start of [undefined, null, -1, '0']) {
+    h.sockets[0].result({type:'Results',is_final:true,start,duration:2,channel:{alternatives:[{transcript:''}]}});
+    assert.equal(h.transcripts.at(-1).start,null);
+    h.sockets[0].result({type:'SpeechStarted',timestamp:start});
+    assert.equal(h.transcripts.at(-1).start,null);
+    h.sockets[0].result({type:'UtteranceEnd',last_word_end:start});
+    assert.equal(h.transcripts.at(-1).start,null);
+  }
 });
