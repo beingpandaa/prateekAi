@@ -1,0 +1,17 @@
+node_modules/
+.artifacts/
+dist/
+test-output/
+mock-user-data/
+*.log
+*.zip
+*.exe
+*.mp4
+*.wav
+.env
+.env.*
+settings.json
+diagnostics-*.json
+profile*/
+coverage/
+

@@ -1,0 +1,30 @@
+name: Offline checks
+on:
+  push:
+    branches: [master, voice-reliability]
+  pull_request:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pnpm
+        run: npm install --global pnpm@11.19.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Backend regressions (mock network)
+        run: pnpm test
+      - name: Configuration UI
+        run: pnpm test:ui
+      - name: Answer popup
+        run: pnpm test:content
+      - name: Cross-layer flow
+        run: pnpm test:flow
+

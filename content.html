@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>prateekAi · Answers</title>
+  <link rel="stylesheet" href="content.css">
+</head>
+<body>
+  <div class="surface">
+    <header class="drag-strip">
+      <div class="status" role="status"><span id="statusDot" class="status-dot"></span><span id="statusText">Ready</span></div>
+      <div class="tools">
+        <button id="cancelAnswer" class="icon-button hidden" aria-label="Stop this answer" data-help="Stop answer"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5" y="5" width="10" height="10" rx="2"/></svg></button>
+        <button id="composeButton" class="icon-button" aria-label="Type a question" aria-expanded="false" data-help="Type a question · Ctrl Enter"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 3.5 4 4M4 12l9-9a1.4 1.4 0 0 1 2 0l2 2a1.4 1.4 0 0 1 0 2l-9 9-5 1 1-5Z"/></svg></button>
+        <button id="menuButton" class="icon-button" aria-label="Reading controls and setup" aria-haspopup="dialog" aria-expanded="false" data-help="Reading controls"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="4" cy="10" r="1"/><circle cx="10" cy="10" r="1"/><circle cx="16" cy="10" r="1"/></svg></button>
+        <button id="closeContent" class="icon-button close-button" aria-label="Stop listening and close answers" data-help="Stop listening and close"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg></button>
+      </div>
+    </header>
+
+    <section id="questionSection" class="question-section hidden" aria-label="Current question">
+      <div id="currentQuestion" class="question-text"></div>
+      <button id="expandQuestion" class="text-button hidden" aria-expanded="false">Show full question</button>
+    </section>
+    <div id="message" class="message hidden" role="status"></div>
+    <form id="composer" class="composer hidden" autocomplete="off">
+      <input id="manualQuestion" aria-label="Your question" placeholder="Type a question…" maxlength="6000">
+      <button id="askButton" class="ask-button" type="submit">Ask</button>
+      <button id="dismissComposer" class="icon-button" type="button" aria-label="Dismiss question input"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8"/></svg></button>
+    </form>
+
+    <main id="answerScroll" class="answer-scroll" tabindex="0" aria-label="Answer" aria-busy="false">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <h1>Your next question<br>will appear here.</h1>
+        <p id="emptyHint">Start listening from Setup.<br>Turn on Auto-answer for answers as you talk.</p>
+        <div class="empty-actions"><button id="emptySetup" class="text-button">Open Setup <span aria-hidden="true">↗</span></button><button id="emptyExample" class="text-button">See an example</button></div>
+      </div>
+      <article id="answerBody" class="answer-body hidden"></article>
+      <div id="answerPlaceholder" class="answer-placeholder hidden"><span class="waiting-dot" aria-hidden="true"></span><span id="placeholderText">Preparing an answer…</span></div>
+    </main>
+
+    <div id="readingMenu" class="reading-menu hidden" role="dialog" aria-label="Reading controls">
+      <button id="openSetup" class="menu-action">Open Setup <span aria-hidden="true">↗</span></button>
+      <button id="showExample" class="menu-action">Show offline example</button>
+      <div class="menu-divider"></div>
+      <div class="setting-row"><span>Text size</span><div class="size-controls"><button id="smallerText" class="small-button" aria-label="Smaller answer text">A−</button><output id="textSize">20</output><button id="largerText" class="small-button" aria-label="Larger answer text">A+</button></div></div>
+      <label class="opacity-label" for="backgroundOpacity"><span>Background</span><output id="opacityValue">92%</output></label>
+      <input id="backgroundOpacity" class="opacity-slider" type="range" min="45" max="100" step="1" value="92">
+      <div class="menu-divider"></div>
+      <div id="answerDetails" class="answer-details">No answer yet</div>
+      <button id="hideContent" class="menu-action">Hide answers <span class="shortcut">Ctrl Shift H</span></button>
+      <button id="stopListening" class="menu-action">Stop listening</button>
+    </div>
+    <div id="tooltip" class="tooltip hidden" role="tooltip"></div>
+    <button id="resizeHandle" class="resize-handle" aria-label="Resize answers. Drag, or use arrow keys to resize by 20 pixels." type="button"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 13 13 5M10 13l3-3"/></svg></button>
+  </div>
+  <script src="content.js"></script>
+</body>
+</html>

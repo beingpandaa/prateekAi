@@ -1,0 +1,56 @@
+'use strict';
+const {app,BrowserWindow,session}=require('electron');
+const fs=require('node:fs'),path=require('node:path');
+const out=path.resolve(__dirname,'../../ui-refresh-tests');
+app.setPath('userData',path.join(out,'profile-v05'));
+const checks=[],errors=[];let win;
+const deadline=setTimeout(()=>app.exit(2),30000);
+app.whenReady().then(async()=>{
+ fs.mkdirSync(out,{recursive:true});
+ session.defaultSession.webRequest.onBeforeRequest((details,callback)=>callback({cancel:!/^(file:|data:|devtools:)/.test(details.url)}));
+ win=new BrowserWindow({width:1000,height:760,minWidth:780,minHeight:600,frame:false,show:false,backgroundColor:'#11161d',webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false}});
+ win.webContents.on('console-message',(_,level,message)=>{if(level>=3)errors.push(message)});
+ await win.loadFile(path.resolve(__dirname,'../index.html'));win.showInactive();
+ const run=code=>win.webContents.executeJavaScript(code);
+ const result=await run(`(async()=>{
+ const checks=[],$=id=>document.getElementById(id),tick=()=>new Promise(r=>setTimeout(r,40));
+ const check=(name,value)=>{checks.push({name,passed:!!value});if(!value)throw new Error(name)};
+ await tick();const smoke=await runSmokeTest();check('Configuration boot and API bridge',smoke.ok);
+ check('Configuration has no answer composer or decorative hero',!$('question')&&!$('answer')&&!$('setupHero'));
+ check('No native popup form controls',document.querySelectorAll('select,[title],input[type=file],[required]').length===0);
+ $('openContent').click();await tick();check('Answer window button delegates without capture',uiTest.counts().contentOpens[0].hideConfig===true&&uiTest.counts().starts.length===0);
+ $('practiceMode').click();await tick();check('Practice mode selects microphone only',$('includeMic').checked&&$('includeMic').disabled);
+ $('liveAutoAnswer').click();await tick();check('Auto-answer synchronizes saved controls',$('autoAnswer').checked&&uiTest.counts().preferences.at(-1).autoAnswer===true);
+ $('callMode').click();await tick();check('Live call restores optional microphone',!$('includeMic').checked&&!$('includeMic').disabled);
+ $('listen').click();await tick();check('Missing speech key prevents audio start',uiTest.counts().starts.length===0&&$('settingsMessage').textContent.includes('Deepgram'));
+ $('answersTab').click();check('Answers tab navigation',!$('answersPanel').classList.contains('hidden')&&$('connectionsPanel').classList.contains('hidden'));
+ $('answerFontSize').value=24;$('answerFontSize').dispatchEvent(new Event('input'));$('answerFontSize').dispatchEvent(new Event('change'));await tick();check('Text size updates and persists',$('textSizeValue').textContent==='24 px'&&uiTest.counts().textSizes.at(-1)===24);
+ $('backgroundOpacity').value=92;$('backgroundOpacity').dispatchEvent(new Event('input'));$('backgroundOpacity').dispatchEvent(new Event('change'));await tick();check('Popup opacity persists without fading setup',uiTest.counts().appearance.at(-1)===92&&getComputedStyle(document.body).backgroundColor==='rgb(17, 22, 29)');
+ $('refreshModels').click();await tick();check('Account model discovery available',$('modelCatalogStatus').textContent.includes('gpt-6-luna'));
+ document.querySelector('.timing-settings').open=true;$('questionPauseMs').value=400;$('questionPauseMs').dispatchEvent(new Event('input'));check('Short pause explains split risk',$('questionPauseValue').textContent==='0.4 s'&&$('questionPauseOutcome').textContent.includes('split'));
+ document.querySelector('[data-timing-help="questionPauseHelp"]').click();check('Timing help appears inside window',!$('questionPauseHelp').classList.contains('hidden'));
+ $('incompletePauseMs').value=2000;$('questionPauseMs').value=2500;$('questionPauseMs').dispatchEvent(new Event('input'));check('Incomplete window respects completed pause',+$('incompletePauseMs').value>=+$('questionPauseMs').value);
+ $('resetTiming').click();check('Recommended thresholds restore',[+$('questionPauseMs').value,+$('incompletePauseMs').value,+$('answerTimeoutMs').value].join()==='800,6500,75000');
+ $('contextTab').click();$('roleTitle').value='Senior Engineer';$('roleDescription').value='Design distributed services';$('context').value='Built a CRM integration';$('save').click();$('save').click();check('Save has immediate double-click guard',$('save').disabled);await tick();check('Role requirements and candidate facts persist separately',uiTest.counts().saveCount===1&&uiTest.counts().roleTitle==='Senior Engineer'&&uiTest.counts().roleDescription==='Design distributed services'&&uiTest.counts().context==='Built a CRM integration');
+ $('connectionsTab').click();$('openaiKey').value='UNSAVED-OTHER-KEY';document.querySelector('[data-provider=anthropic]').click();$('anthropicKey').value='FAKE-CLAUDE-TEST-ONLY';$('answersTab').click();$('model').value='claude-sonnet-5-5';$('save').click();await tick();check('Only selected provider key is submitted',uiTest.counts().credentialFields.join()==='anthropicKey');check('Successful save clears selected credential input',$('anthropicKey').value==='');check('Other provider draft preserved',$('openaiKey').value==='UNSAVED-OTHER-KEY');
+ $('sessionTab').click();uiTest.emit({type:'transcript',source:'you',turnId:'1',text:'Can you explain',isFinal:true});uiTest.emit({type:'transcript',source:'you',turnId:'1',text:'Can you explain closures?',isFinal:true});check('Speech fragments update one transcript row',$('transcript').children.length===1&&$('transcript').textContent.includes('closures'));
+ uiTest.emit({type:'transcript',source:'remote',turnId:'2',text:'<img src=x onerror=alert(1)>',isFinal:true});check('Transcript renders untrusted HTML as text',!$('transcript').querySelector('img')&&$('transcript').textContent.includes('<img'));
+ uiTest.emit({type:'hotkey-answer'});check('Configuration does not duplicate popup inference',uiTest.counts().asks===0);
+ $('connectionsTab').focus();$('connectionsTab').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));check('Tabs support keyboard navigation',document.activeElement===$('answersTab'));
+ uiTest.emit({type:'settings-changed',settings:{answerFontSize:22,backgroundOpacity:95}});check('Popup appearance changes synchronize setup',$('answerFontSize').value==='22'&&$('backgroundOpacity').value==='95');
+ $('contextTab').click();$('roleTitle').value='Unsaved role';const opens=uiTest.counts().contentOpens.length;$('openContent').click();await tick();check('Unsaved role cannot silently use old answer context',uiTest.counts().contentOpens.length===opens&&$('notice').textContent.includes('Save setup'));
+ $('listen').click();await tick();check('Unsaved settings block capture before any speech request',uiTest.counts().starts.length===0&&$('settingsMessage').textContent.includes('Unsaved'));
+ $('save').click();check('Save disables starting and provider preference changes',$('listen').disabled&&$('liveAutoAnswer').disabled&&$('openContent').disabled);await tick();
+ $('autoAnswer').checked=!$('autoAnswer').checked;const draftAuto=$('autoAnswer').checked;$('practiceMode').click();await tick();check('Changing source preserves unsaved automatic-answer draft',$('autoAnswer').checked===draftAuto);uiTest.emit({type:'auth-complete',settings:{answerProvider:'anthropic',providerModels:{anthropic:'claude-sonnet-5-5'},model:'claude-sonnet-5-5',autoAnswer:!draftAuto,sessionMode:'call'},message:'Connected'});check('Auth refresh preserves unsaved automatic-answer draft',$('autoAnswer').checked===draftAuto);
+ $('connectionsTab').click();await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));return checks;
+ })()`);
+ checks.push(...result);fs.writeFileSync(path.join(out,'setup.png'),(await win.webContents.capturePage()).toPNG());
+ await run("document.getElementById('contextTab').click();new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");fs.writeFileSync(path.join(out,'setup-role.png'),(await win.webContents.capturePage()).toPNG());
+ for(const [width,height]of[[780,600],[1280,900]]){
+ win.setSize(width,height);await new Promise(r=>setTimeout(r,70));
+ const geometry=await run(`(()=>{const panels=['connections','answers','context','session'];return panels.map(name=>{document.getElementById(name+'Tab').click();const save=document.getElementById('save').getBoundingClientRect();return {name,ok:document.documentElement.scrollWidth<=innerWidth&&save.bottom<=innerHeight&&save.right<=innerWidth};})})()`);
+ checks.push(...geometry.map(g=>({name:g.name+' fits '+width+'×'+height,passed:g.ok})));
+ if(width===780)fs.writeFileSync(path.join(out,'setup-minimum.png'),(await win.webContents.capturePage()).toPNG());
+ }
+ const ok=checks.every(c=>c.passed)&&errors.length===0;fs.writeFileSync(path.join(out,'result.json'),JSON.stringify({ok,checks,errors},null,2));clearTimeout(deadline);app.exit(ok?0:1);
+}).catch(error=>{fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'result.json'),JSON.stringify({ok:false,error:error.stack,checks,errors},null,2));clearTimeout(deadline);app.exit(1)});
