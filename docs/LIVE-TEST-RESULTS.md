@@ -40,7 +40,9 @@ Offline regressions reproduce and address four audio-state failures: late interi
 
 The backend suite passed **449 tests, 0 failed**. The production cross-layer suite passed **58 checks**, using 19 mocked answer requests and 3 fake speech connections, with zero real cloud requests or hardware audio capture. New wire-level cases pass partial Results and UtteranceEnd through the actual SpeechSession parser and verify the complete constraint reaches the answer request. Council review also replayed recovery against retained expired content and confirmed no stale or duplicate submission. These are deterministic source tests, not evidence of real ASR accuracy or live model quality.
 
-Version 0.6.2 identifies this source revision; it has not been packaged or installed for live use. The earlier 0.6.1 Windows Application Control launch block remains unresolved. Existing portable folders do not contain these newer source changes. Live acceptance and distribution trust remain open gates.
+Version 0.6.2 was subsequently packaged into a fresh portable folder from source commit `73305483f521b3536559ef3247d4b552c0c4d38c`. All 20 application-asset hashes matched the manifest, including the audio-finality module. Its packaged Setup and answer-window smoke checks passed with an isolated profile and exit code 0. A normal launch then opened the updated app with the existing compatible profile; listening remained stopped and no live transcription or answer test was started.
+
+The earlier 0.6.1 Windows Application Control block remains part of the historical record. The unmodified 0.6.2 build launched while Smart App Control remained enabled; no security policy, certificate trust, or executable fallback was changed. The reason for the differing Windows trust decisions is unknown. This establishes launch on this PC only: the build remains unsigned, other PCs may block it, and live acceptance and distribution signing remain open gates.
 
 ## Run record template
 
