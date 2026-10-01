@@ -1,12 +1,14 @@
 'use strict';
 const { contextBridge } = require('electron');
-let listener, sequence = 0, resolveSnapshot, resolveAsk, rejected = false, holdResize = false;
+let listener, sequence = 0, resolveSnapshot, resolveAsk, rejected = false, holdResize = false, pendingQuestion = '';
 const resizeResolvers = [];
 const settings = { answerFontSize: 20, backgroundOpacity: 92, autoAnswer: true, sessionMode: 'call' };
-const calls = { asks: [], cancel: 0, setup: 0, close: 0, hide: 0, stops: 0, fonts: [], opacity: [], resizes: [] };
+const calls = { asks: [], pending: [], cancel: 0, setup: 0, close: 0, hide: 0, stops: 0, fonts: [], opacity: [], resizes: [] };
 const emit = event => {
   const seq = Number.isFinite(event.seq) ? event.seq : sequence + 1;
   sequence = Math.max(sequence, seq);
+  if (event.type === 'question') pendingQuestion = event.text;
+  if (['answer-start', 'session-reset', 'session-stopped'].includes(event.type)) pendingQuestion = '';
   listener?.({ ...event, seq });
 };
 contextBridge.exposeInMainWorld('prateekAi', {
@@ -17,6 +19,7 @@ contextBridge.exposeInMainWorld('prateekAi', {
   closeContent: async () => { calls.close++; },
   resizeContent: size => { calls.resizes.push(size); return holdResize ? new Promise(resolve => resizeResolvers.push(() => resolve(size))) : Promise.resolve(size); },
   ask: question => { calls.asks.push(question); if (rejected) { rejected = false; return Promise.reject(new Error('Test provider not connected.')); } return new Promise(resolve => { resolveAsk = resolve; }); },
+  submitPending: input => { calls.pending.push(input); if (!pendingQuestion) return Promise.resolve({ ok: false, message: 'No recent unanswered question is ready.' }); pendingQuestion = ''; return new Promise(resolve => { resolveAsk = resolve; }); },
   cancelAnswer: async () => { calls.cancel++; emit({ type: 'answer-cancelled' }); resolveAsk?.({ ok: true }); },
   stop: async () => { calls.stops++; emit({ type: 'session-stopped', reason: 'Listening stopped.' }); },
   clear: async () => emit({ type: 'session-reset' }),

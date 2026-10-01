@@ -1,6 +1,7 @@
 'use strict';
 
 const api = window.prateekAi;
+let lastHotkeySequence = 0;
 const $ = id => document.getElementById(id);
 const idleAnswer = () => ({ id: null, question: '', text: '', state: 'idle', message: '' });
 let state = { seq: 0, settings: { answerFontSize: 20, backgroundOpacity: 92 }, live: false, question: '', answer: idleAnswer(), sources: {} };
@@ -109,6 +110,11 @@ function updateStatus() {
     Number.isFinite(state.answer.firstTextMs) ? `First text ${elapsed(state.answer.firstTextMs)}` : '',
     Number.isFinite(state.answer.elapsedMs) ? `Total ${elapsed(state.answer.elapsedMs)}` : ''].filter(Boolean);
   $('answerDetails').textContent = details.join(' · ') || 'No answer yet';
+  const voice = state.voiceCommandStatus;
+  const voiceVisible = !!state.settings.voiceFallbackEnabled && state.live && !previewMode;
+  $('voiceCommandStatus').classList.toggle('hidden', !voiceVisible);
+  $('voiceCommandStatus').dataset.status = voice?.status || 'ready';
+  $('voiceCommandStatus').textContent = voice?.message || 'Voice fallback ready · say a saved command to answer the pending question.';
 }
 function renderQuestion() {
   const question = state.answer.question || (state.answer.id === null ? state.question : '');
@@ -167,8 +173,16 @@ function showMenu() {
 function reset() {
   state.question = ''; state.answer = idleAnswer(); state.sources = {}; nextQuestion = ''; noticeText = ''; submission = null; sending = false;
   previewMode = false; renderedId = null; renderedText = null; questionExpanded = false; $('answerScroll').scrollTop = 0;
+  state.voiceCommandStatus = null;
 }
 function applyEvent(event) {
+  // Commands are not represented by the state snapshot. Replay one buffered
+  // hotkey even when its sequence is already included in that snapshot.
+  if (event?.type === 'hotkey-answer' && Number.isFinite(event.seq)) {
+    if (event.seq <= lastHotkeySequence) return;
+    lastHotkeySequence = event.seq;
+    submitPending(); return;
+  }
   if (!event || typeof event !== 'object' || !Number.isFinite(event.seq) || event.seq <= lastSeq) return;
   lastSeq = event.seq; state.seq = event.seq;
   if (event.type === 'settings-changed' || event.type === 'session-preferences') { applySettings(event.settings); renderAnswer(); return; }
@@ -181,13 +195,8 @@ function applyEvent(event) {
     sending = false; submission = null; flushAnswer(); return;
   }
   if (event.type === 'speech-state') { state.sources[event.source] = event.state; updateStatus(); return; }
+  if (event.type === 'voice-command-status') { state.voiceCommandStatus = { status: event.status, message: event.message }; updateStatus(); return; }
   if (event.type === 'notice') { noticeText = event.message || ''; renderAnswer(); return; }
-  if (event.type === 'hotkey-answer') {
-    if (sending || busy()) return;
-    const question = $('manualQuestion').value.trim() || state.question || (previewMode ? '' : state.answer.question);
-    if (question) ask(question); else setComposer(true);
-    return;
-  }
   if (event.type === 'question-preview') { nextQuestion = event.pending ? event.text || '' : ''; updateStatus(); return; }
   if (event.type === 'question') { state.question = event.text || ''; if (!state.answer.question) renderQuestion(); return; }
   if (event.type === 'answer-start') {
@@ -196,6 +205,7 @@ function applyEvent(event) {
       if (draftRevision === submission.revision && $('manualQuestion').value === submission.draft) { $('manualQuestion').value = ''; draftRevision++; setComposer(false); }
       submission = null;
     }
+    if (submission?.pending) submission = null;
     sending = false; nextQuestion = ''; noticeText = '';
     state.answer = { ...idleAnswer(), ...event, state: 'generating', text: '', phase: 'waiting-first-text' };
     $('answerScroll').scrollTop = 0; flushAnswer(); return;
@@ -234,6 +244,17 @@ async function perform(action, button) {
   if (button) button.disabled = true;
   try { await action(); } catch (error) { noticeText = error.message || 'The action could not be completed.'; renderAnswer(); }
   finally { if (button) button.disabled = false; }
+}
+async function submitPending() {
+  if (sending) return;
+  const token = { pending: true };
+  sending = true; submission = token; noticeText = ''; renderAnswer();
+  try {
+    const result = await api.submitPending({ trigger: 'hotkey' });
+    if (submission === token && result?.ok === false) noticeText = result.message || 'No recent unanswered question is ready. Ask again or type a question.';
+    else if (submission === token && result?.message) noticeText = result.message;
+  } catch (error) { if (submission === token) noticeText = error.message || 'The pending question could not be submitted.'; }
+  finally { if (submission === token) { submission = null; sending = false; renderAnswer(); } }
 }
 async function ask(explicitQuestion) {
   const draft = $('manualQuestion').value, question = typeof explicitQuestion === 'string' ? explicitQuestion.trim() : draft.trim();

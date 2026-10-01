@@ -10,7 +10,7 @@ const STOP_TIMEOUT_MS = 1_500;
 const MAX_RETRIES = 3;
 
 class SpeechSession {
-  constructor({ apiKey, source, sampleRate, onTranscript = () => {}, onState = () => {}, onError = () => {}, WebSocketImpl } = {}) {
+  constructor({ apiKey, source, sampleRate, language = 'en', onTranscript = () => {}, onState = () => {}, onError = () => {}, WebSocketImpl } = {}) {
     if (typeof apiKey !== 'string' || !apiKey.trim() || /[\r\n]/.test(apiKey)) throw new TypeError('A valid Deepgram API key is required.');
     if (typeof source !== 'string' || !source) throw new TypeError('An audio source is required.');
     if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000) throw new TypeError('Audio sample rate must be an integer from 8000 to 96000.');
@@ -18,6 +18,8 @@ class SpeechSession {
     this._apiKey = apiKey.trim();
     this.source = source;
     this.sampleRate = sampleRate;
+    if (!['en', 'multi'].includes(language)) throw new TypeError('Choose English or multilingual transcription.');
+    this.language = language;
     this._WebSocket = WebSocketImpl || require('ws');
     this._onTranscript = onTranscript;
     this._onState = onState;
@@ -86,11 +88,21 @@ class SpeechSession {
     return this._stopPromise;
   }
 
+  finalize() {
+    // Finalize does not close the socket. Never flush past locally buffered
+    // audio: that would falsely suggest all captured speech was finalized.
+    if (!this._active || this._stopping || this._socket?.readyState !== 1) return false;
+    this._flush();
+    if (this._queuedBytes || this._socket.bufferedAmount > SEND_HIGH_WATER_BYTES) return false;
+    this._sendControl(this._socket, { type: 'Finalize' });
+    return true;
+  }
+
   _connect() {
     if (!this._active) return;
     this._setState(this._retries ? 'reconnecting' : 'connecting');
     const params = new URLSearchParams({
-      model: 'nova-3', language: 'en', encoding: 'linear16', sample_rate: String(this.sampleRate),
+      model: 'nova-3', language: this.language, encoding: 'linear16', sample_rate: String(this.sampleRate),
       channels: '1', interim_results: 'true', punctuate: 'true', smart_format: 'true',
       endpointing: '500', utterance_end_ms: '1200', vad_events: 'true'
     });

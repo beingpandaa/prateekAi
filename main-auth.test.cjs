@@ -40,6 +40,8 @@ function harness(t, oauth) {
     globalShortcut: { isRegistered: () => true },
     shell: { openExternal: async () => { throw new Error('Unexpected browser request.'); } },
   };
+  let profileDisk = null;
+  const profileTemps = new Map();
   const mocks = {
     electron,
     './provider-adapters.cjs': { streamProviderAnswer: async value => { requests.push(value); return { text: 'Test answer.' }; },
@@ -47,6 +49,8 @@ function harness(t, oauth) {
       listProviderModels: async () => { throw new Error('Unexpected non-plan catalog request.'); } },
     './speech.cjs': { SpeechSession: class { constructor() { throw new Error('Unexpected speech session.'); } } },
     './turns.cjs': require('./turns.cjs'),
+    './voice-fallback.cjs': require('./voice-fallback.cjs'),
+    './profile.cjs': require('./profile.cjs'),
     './routing.cjs': require('./routing.cjs'),
     './oauth.cjs': {
       beginSignIn: async () => { throw new Error('Unexpected sign-in.'); },
@@ -56,7 +60,11 @@ function harness(t, oauth) {
       ...oauth,
     },
     'node:fs': {
-      mkdirSync() {}, writeFileSync: (_, content) => writes.push(JSON.parse(content)), renameSync() {},
+      existsSync: () => false, mkdirSync() {},
+      readFileSync() { if (profileDisk === null) throw Object.assign(new Error('Missing fixture'), {code:'ENOENT'}); return profileDisk; },
+      writeFileSync(file, content) { profileTemps.set(file, content); writes.push(JSON.parse(content)); },
+      renameSync(file) { profileDisk = profileTemps.get(file); profileTemps.delete(file); },
+      unlinkSync(file) { profileTemps.delete(file); }
     },
     'node:crypto': require('node:crypto'),
     'node:path': path,
@@ -73,7 +81,7 @@ function harness(t, oauth) {
     windowForTest: window,
   });
   vm.runInContext(source + `
-    win = windowForTest;
+    readConfig(); win = windowForTest;
     registerIPC();
     globalThis.probe = {
       setProfile(value) { chatgptProfile = value; },

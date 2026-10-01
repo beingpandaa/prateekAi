@@ -283,3 +283,21 @@ test('rejects malformed capture bytes before sending to the paid service', async
   assert.throws(() => session.sendAudio(Buffer.alloc(3)), /complete two-byte/);
   assert.equal(sockets[0].sent.length, 0);
 });
+
+test('Finalize flushes without closing a healthy stream and accepts another question', async t => {
+  const h = harness(t, {language:'multi'}); const starting = h.session.start(); h.sockets[0].open(); await starting;
+  assert.equal(new URL(h.sockets[0].url).searchParams.get('language'), 'multi');
+  h.session.sendAudio(Buffer.from([0,0,0,0]));
+  assert.equal(h.session.finalize(), true);
+  assert.equal(h.sockets[0].sent.filter(x => typeof x.data === 'string' && JSON.parse(x.data).type === 'Finalize').length, 1);
+  assert.equal(h.sockets[0].terminated, false);
+  assert.equal(h.session.sendAudio(Buffer.from([0,0])), true);
+});
+
+test('Finalize cannot claim to flush a disconnected or backlogged stream', async t => {
+  const h = harness(t); assert.equal(h.session.finalize(), false);
+  const starting = h.session.start(); h.sockets[0].open(); await starting;
+  h.sockets[0].bufferedAmount = 300000;
+  h.session.sendAudio(Buffer.from([0,0])); assert.equal(h.session.finalize(), false);
+  h.sockets[0].bufferedAmount = 0;
+});

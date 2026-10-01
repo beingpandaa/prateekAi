@@ -9,6 +9,7 @@ const { pathToFileURL } = require('node:url');
 const source = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8');
 
 const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+const enableVoice = (h, values = {}) => h.invoke('settings:save', { voiceFallbackEnabled: true, ...values });
 function deferred() {
   let resolve, reject;
   const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
@@ -65,6 +66,8 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
     appEvents.get('before-quit')?.();
     for (const target of windows) target.destroy();
   };
+  let profileDisk = savedConfig ? JSON.stringify(savedConfig) : null;
+  const profileTemps = new Map();
   const mocks = {
     electron: {
       app: { getPath: () => path.join(__dirname, 'mock-user-data'), setPath() {}, setName() {}, whenReady: () => ({ then: () => ({ catch() {} }) }), on: (name, callback) => appEvents.set(name, callback), quit },
@@ -97,13 +100,22 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
       constructor(options) { this.options = options; this.chunks = []; this.stops = 0; connections.push(this); }
       async start() {}
       stop() { this.stops++; this.options.onState('stopped'); }
+      finalize() { this.finalizes = (this.finalizes || 0) + 1; return true; }
       sendAudio(chunk) { this.chunks.push(chunk); }
       transcript(text, extra = {}) { this.options.onTranscript({ source: this.options.source, text, isFinal: true, speechFinal: true, ...extra }); }
     } },
     './turns.cjs': require('./turns.cjs'),
+    './voice-fallback.cjs': require('./voice-fallback.cjs'),
+    './profile.cjs': require('./profile.cjs'),
     './routing.cjs': require('./routing.cjs'),
     './oauth.cjs': oauth,
-    'node:fs': { mkdirSync() {}, writeFileSync: (_, content) => writes.push(JSON.parse(content)), renameSync() {}, readFileSync() { if (!savedConfig) throw new Error('No mock configuration.'); return JSON.stringify(savedConfig); } },
+    'node:fs': {
+      existsSync: () => false, mkdirSync() {},
+      readFileSync() { if (profileDisk === null) throw Object.assign(new Error('Missing fixture'), {code:'ENOENT'}); return profileDisk; },
+      writeFileSync(file, content) { profileTemps.set(file, content); writes.push(JSON.parse(content)); },
+      renameSync(file) { profileDisk = profileTemps.get(file); profileTemps.delete(file); },
+      unlinkSync(file) { profileTemps.delete(file); }
+    },
     'node:crypto': require('node:crypto'), 'node:path': path, 'node:url': require('node:url'),
   };
   const context = vm.createContext({
@@ -114,11 +126,11 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
     fetch: (url, options) => { fetches.push({ url, options }); if (!fetchImpl) throw new Error('Unexpected network request.'); return fetchImpl(url, options); },
   });
   vm.runInContext(source + `
-    win = windowForTest; registerIPC();
+    readConfig(); win = windowForTest; registerIPC();
     globalThis.probe = {
       initialize(hasAnswerKey) { secrets.deepgram = 'fake-speech-key'; secrets.openai = hasAnswerKey ? 'fake-answer-key' : ''; settings.answerProvider = 'openai'; },
       state() { return { live, sessionId, captureAllowed, activeSessionMode, questionSource, autoCount, answers,
-        queuedAutomatic, requestController, history, settings, catalog: publicCatalog(), profile: chatgptProfile, speechSources: [...speech.keys()] }; },
+        queuedAutomatic, answerQueue, pending: pendingBuffer?.snapshot(), voiceCommandStatus, requestController, history, settings, catalog: publicCatalog(), profile: chatgptProfile, speechSources: [...speech.keys()] }; },
       setProfile(profile, select) { chatgptProfile = profile; if (select) { settings.answerProvider = profile ? 'chatgpt' : 'openai'; settings.model = settings.providerModels[settings.answerProvider]; settings.fastModel = settings.providerFastModels[settings.answerProvider]; } },
       read() { readConfig(); },
       createRoot() { return createWindow(); },
@@ -223,22 +235,17 @@ test('three consecutive microphone questions each answer after the previous stre
   assert.match(h.requests[2].options.transcript, /Previous assistant suggestions/);
 });
 
-test('a filtered statement and a recent exact repeat do not block the next distinct automatic question', async t => {
-  const h = harness(t);
-  await h.start('practice');
-  const microphone = h.connection('you');
-  microphone.transcript('Explain closures.'); await h.tick(800);
-  microphone.transcript('Thank you.'); await h.tick(800);
-  microphone.transcript('Explain closures.'); await h.tick(800);
-  assert.equal(h.requests.length, 1, 'A recent exact repeat is skipped without disabling Auto');
+test('acknowledgments do not block intentional repeated questions or the next question', async t => {
+  const h = harness(t); await h.start('practice'); const mic = h.connection('you');
+  mic.transcript('Explain closures.', {start:0,duration:1}); await h.tick(800);
+  mic.transcript('Thank you.', {start:2,duration:1}); await h.tick(800);
+  mic.transcript('Explain closures.', {start:4,duration:1}); await h.tick(800);
+  assert.equal(h.requests.length, 2, 'A distinct spoken repetition is an intentional request');
+  mic.transcript('Explain closures.', {start:4,duration:1}); await h.tick(800);
+  assert.equal(h.requests.length, 2, 'The same audio packet is still deduplicated');
+  mic.transcript('Explain promises.', {start:6,duration:1}); await h.tick(800);
+  assert.equal(h.requests.length, 3); assert.equal(h.requests[2].options.question, 'Explain promises.');
   assert.equal(h.state().settings.autoAnswer, true);
-  microphone.transcript('Explain promises.'); await h.tick(800);
-  assert.equal(h.requests.length, 2);
-  assert.equal(h.requests[1].options.question, 'Explain promises.');
-  await h.tick(12000);
-  microphone.transcript('Explain closures.'); await h.tick(800);
-  assert.equal(h.requests.length, 3, 'The recent-question dedupe expires within the same session');
-  assert.equal(h.state().autoCount, 3);
 });
 
 test('unexpected audio/transcript sources cannot create extra streams or questions', async t => {
@@ -282,7 +289,7 @@ test('manually submitting a pending transcript prevents a duplicate automatic an
   assert.equal(h.state().autoCount, 1);
 });
 
-test('automatic turns wait for a manual answer and keep only the newest queued question', async t => {
+test('automatic turns wait for a manual answer and preserve every independent queued question', async t => {
   const h = harness(t, { holdAnswers: true });
   await h.start('practice');
   const manual = h.invoke('answer:ask', { question: 'Explain a mutex.' });
@@ -293,9 +300,12 @@ test('automatic turns wait for a manual answer and keep only the newest queued q
   assert.equal(h.state().autoCount, 0);
   h.requests[0].finish(); await manual; await settle();
   assert.equal(h.requests.length, 2);
-  assert.equal(h.requests[1].options.question, 'Explain a queue.');
+  assert.equal(h.requests[1].options.question, 'What is a closure?');
   assert.equal(h.state().autoCount, 1);
   h.requests[1].finish(); await settle();
+  assert.equal(h.requests.length, 3);
+  assert.equal(h.requests[2].options.question, 'Explain a queue.');
+  h.requests[2].finish(); await settle();
 });
 
 test('a new automatic turn does not interrupt an automatic answer already streaming', async t => {
@@ -1201,4 +1211,300 @@ test('new sessions and provider destinations reset the answer count shown by sna
   assert.equal(h.invoke('content:state').answers, 1);
   h.invoke('settings:save', { answerProvider: 'anthropic' });
   assert.equal(h.invoke('content:state').answers, 0);
+});
+
+test('F01 voice fallback submits a retained non-interrogative task with Auto off and strips the cue', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  const remote = h.connection('remote'), mic = h.connection('you');
+  remote.transcript('An array with positive and negative numbers, target K, longest contiguous matching sum length.');
+  await h.tick(1000); assert.equal(h.requests.length, 0);
+  mic.transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.match(h.requests[0].options.question, /negative numbers.*contiguous/);
+  assert.doesNotMatch(h.requests[0].options.transcript, /Give me a minute/);
+  assert.equal(h.events.find(e => e.type === 'answer-start').trigger, 'voice');
+  assert.equal(h.state().autoCount, 1);
+  assert.equal(h.state().voiceCommandStatus.status, 'submitted');
+});
+
+test('F02 finalization waits for unresolved question text and submits only after its final arrives', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  const remote = h.connection('remote');
+  remote.transcript('Given an array.', {start:0,duration:1});
+  remote.transcript('Return the longest subarray', {isFinal:false,start:2,duration:1});
+  h.connection('you').transcript('Give me a minute to think.'); await settle();
+  assert.equal(remote.finalizes, 1); assert.equal(h.requests.length, 0);
+  await h.tick(1000);
+  remote.transcript('Return the longest subarray summing to K.', {start:2,duration:2}); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.match(h.requests[0].options.question, /Given an array.*Return the longest subarray summing to K/);
+});
+
+test('F02 missing final expires without a partial paid request and recovers on the next question', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('What is', {isFinal:false,start:0,duration:1});
+  h.connection('you').transcript('Give me a minute to think.'); await settle();
+  await h.tick(1500);
+  assert.equal(h.requests.length, 0);
+  assert.match(h.state().voiceCommandStatus.message, /incomplete/);
+  await h.tick(6500);
+  h.connection('remote').transcript('What are closures?', {start:0,duration:3});
+  h.connection('you').transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1);
+});
+
+test('F03 split command finals and duplicate packets create one request in Mic practice', async t => {
+  const h = harness(t); enableVoice(h); await h.start('practice', false);
+  const mic = h.connection('you');
+  mic.transcript('What are closures?', {start:0,duration:1});
+  mic.transcript('Give me a', {start:2,duration:1}); await h.tick(500);
+  assert.equal(h.requests.length, 0);
+  mic.transcript('minute to think.', {start:3,duration:1}); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].options.question, 'What are closures?');
+  mic.transcript('minute to think.', {start:3,duration:1}); await h.tick(7000);
+  assert.equal(h.requests.length, 1);
+  assert.doesNotMatch(h.requests[0].options.transcript, /minute to think|Give me a/);
+});
+
+test('F04 simultaneous automatic completion and spoken submission deduplicate by question identity', async t => {
+  const h = harness(t, {holdAnswers:true}); enableVoice(h); await h.start('call');
+  h.connection('remote').transcript('Explain closures.');
+  await h.tick(800);
+  h.connection('you').transcript('Gimme a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].options.signal.aborted, false);
+  assert.match(h.state().voiceCommandStatus.message, /already/);
+  h.requests[0].finish(); await settle();
+});
+
+test('F05 repeated voice cues do not restart an answer, including after cooldown', async t => {
+  const h = harness(t, {holdAnswers:true}); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('Explain closures.');
+  const mic = h.connection('you'); mic.transcript('Give me a minute to think.'); await settle();
+  mic.transcript('Give me a minute to think.'); await settle(); await h.tick(3100);
+  mic.transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.signal.aborted, false);
+  h.requests[0].finish(); await settle();
+});
+
+test('F06 incoming audio cannot issue a voice command and command-only mic speech is excluded from context', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('Explain promises.');
+  h.connection('you').transcript('Private ordinary candidate speech.');
+  h.connection('remote').transcript('Give me a minute to think.'); await h.tick(1000);
+  assert.equal(h.requests.length, 0);
+  h.connection('you').transcript('Let me think through this for a moment.'); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.doesNotMatch(h.requests[0].options.transcript, /Private ordinary candidate/);
+});
+
+test('F07 quoted, negated and mentioned cues do not execute and typed phrase testing is free', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('Explain closures.');
+  for (const text of ['Do not give me a minute to think.', 'The phrase is "Give me a minute to think."', 'I said give me a minute to think.']) {
+    h.connection('you').transcript(text); await h.tick(1000);
+    assert.equal(h.invoke('voice:test', {text}).matched, false);
+  }
+  assert.equal(h.invoke('voice:test', {text:'Gimme a minute to think.'}).matched, true);
+  assert.equal(h.requests.length, 0);
+});
+
+test('F08 voice cue cannot resurrect an expired question or an empty session', async t => {
+  const h = harness(t); enableVoice(h, {voiceFreshnessMs:30000}); await h.start('call', false);
+  const mic = h.connection('you'); mic.transcript('Give me a minute to think.'); await settle();
+  assert.match(h.state().voiceCommandStatus.message, /No pending/);
+  h.connection('remote').transcript('Explain closures.'); await h.tick(31000);
+  mic.transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 0); assert.match(h.state().voiceCommandStatus.message, /No pending/);
+});
+
+test('F09 full DSA background and constraints survive separated finalized turns before voice submission', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  for (const text of ['You are given an integer array.', 'It includes negative numbers and zeros.', 'Return the length of the longest contiguous subarray whose sum is K.']) {
+    h.connection('remote').transcript(text); await h.tick(1400);
+  }
+  h.connection('you').transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.match(h.requests[0].options.question, /given an integer array.*negative numbers.*longest contiguous/);
+});
+
+test('F10 Mic practice question and terminal voice command in one final excludes the command', async t => {
+  const h = harness(t); enableVoice(h); await h.start('practice', false);
+  h.connection('you').transcript('What are closures? Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.question, 'What are closures?');
+  assert.doesNotMatch(h.requests[0].options.transcript, /minute to think/);
+});
+
+test('F11 voice fallback respects cap and does not silently enable itself or create a third stream', async t => {
+  const h = harness(t); assert.equal(h.invoke('settings:get').voiceFallbackEnabled, false);
+  enableVoice(h, {maxAutoAnswers:1}); await h.start('call', false, true);
+  assert.equal(h.connections.length, 2);
+  h.connection('remote').transcript('Explain closures.');
+  h.connection('you').transcript('Give me a minute to think.'); await settle(); await h.tick(3100);
+  h.connection('remote').transcript('Explain promises.');
+  h.connection('you').transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1); assert.match(h.state().voiceCommandStatus.message, /limit/);
+});
+
+test('F11 voice pending submission is invalidated by stop or an audio gap during finalization', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  const remote = h.connection('remote'); remote.transcript('Given an array.');
+  remote.transcript('Return', {isFinal:false,start:2,duration:1});
+  h.connection('you').transcript('Give me a minute to think.'); await settle();
+  remote.options.onState('reconnecting'); await settle(); await h.tick(1600);
+  assert.equal(h.requests.length, 0);
+  h.invoke('listen:stop'); await h.tick(8000); assert.equal(h.requests.length, 0);
+});
+
+test('F12 custom phrases, Hindi alias and advanced defaults round-trip through settings', async t => {
+  const h = harness(t); const defaults = h.invoke('settings:get');
+  assert.equal(defaults.voiceFreshnessMs, 90000); assert.equal(defaults.voiceCooldownMs, 3000); assert.equal(defaults.voiceFinalizeMs, 1500);
+  assert.equal(h.invoke('voice:test', {text:'एक मिनट, मुझे सोचने दीजिए।'}).matched, true);
+  enableVoice(h, {voiceCommandPhrases:['Please prepare that answer.'],speechLanguage:'multi'}); h.readConfig();
+  assert.equal(h.invoke('voice:test', {text:'Please prepare that answer.'}).matched, true);
+  assert.equal(h.invoke('voice:test', {text:'Give me a minute to think.'}).matched, false);
+  await h.start('practice', false); assert.equal(h.connection('you').options.language, 'multi');
+  assert.throws(() => enableVoice(h), /Stop listening/);
+});
+
+test('a new voice-submitted question queues behind a different answer without interrupting either', async t => {
+  const h = harness(t, {holdAnswers:true}); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('Explain closures.'); h.connection('you').transcript('Give me a minute to think.'); await settle();
+  await h.tick(3100); h.connection('remote').transcript('Explain promises.'); h.connection('you').transcript('Give me a minute to think.'); await settle();
+  assert.equal(h.requests.length, 1); assert.equal(h.state().answerQueue.length, 1);
+  assert.equal(h.requests[0].options.signal.aborted, false);
+  h.requests[0].finish(); await settle(); assert.equal(h.requests.length, 2);
+  assert.equal(h.requests[1].options.question, 'Explain promises.'); h.requests[1].finish(); await settle();
+});
+
+test('hotkey recovers pending text even with voice fallback and Auto both off, but never old answered text', async t => {
+  const h = harness(t); await h.start('call', false);
+  h.connection('remote').transcript('A bounded buffer using multiple producers and consumers.'); await h.tick(1000);
+  assert.equal((await h.invoke('answer:submit-pending')).ok, true); await settle();
+  assert.equal(h.requests.length, 1);
+  assert.equal((await h.invoke('answer:submit-pending')).ok, false);
+  assert.equal(h.requests.length, 1);
+});
+
+test('local diagnostic export is opt-in, credential-free, and records trigger and latency separately', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('Explain closures.'); h.connection('you').transcript('Give me a minute to think.'); await settle();
+  const events = h.invoke('diagnostics:get').events;
+  assert.ok(events.some(e => e.kind === 'question-decision' && e.trigger === 'voice'));
+  assert.ok(events.some(e => e.kind === 'answer-start' && e.provider === 'openai'));
+  const output = h.invoke('diagnostics:export'); assert.equal(output.ok, true);
+  const exported = JSON.stringify(h.writes.at(-1));
+  assert.doesNotMatch(exported, /fake-answer-key|fake-speech-key/);
+});
+
+test('council: an older finalized segment cannot clear a newer unresolved speech span for voice recovery', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  const remote = h.connection('remote');
+  remote.transcript('Return the longest subarray', { isFinal:false, start:0, duration:1 });
+  remote.transcript('Negative numbers are allowed.', { isFinal:false, start:2, duration:1 });
+  remote.transcript('Return the longest subarray with sum K.', { start:0, duration:1 });
+  h.connection('you').transcript('Give me a minute to think.', {start:4,duration:1});
+  await settle(); await h.tick(1500);
+  assert.equal(h.requests.length, 0, 'A finalized older segment does not authorize submitting incomplete newer speech');
+  assert.match(h.state().voiceCommandStatus.message, /incomplete/);
+  remote.transcript('Negative numbers are allowed.', {start:2,duration:1}); await h.tick(1600);
+  h.connection('you').transcript('Give me a minute to think.', {start:6,duration:1}); await settle();
+  assert.equal(h.requests.length, 1); assert.match(h.requests[0].options.question, /Negative numbers are allowed/);
+});
+
+test('council: dropped question audio cannot be overwritten by an automatic continuation across the gap', async t => {
+  const h = harness(t); await h.start('call', true); const remote = h.connection('remote');
+  remote.transcript('Given an integer array.', {start:0,duration:1}); await h.tick(300);
+  remote.options.onError('Audio buffer full; some audio was dropped. Check your connection.');
+  remote.transcript('Return the longest subarray with sum K.', {start:2,duration:1}); await h.tick(1000);
+  assert.equal(h.requests.length, 0, 'Missing constraints must not silently become an apparently complete prompt');
+  remote.transcript('What is a closure?', {start:4,duration:1}); await h.tick(1000);
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.question, 'What is a closure?');
+});
+
+test('council: provider access and quota failures halt queued voice submissions as well as automatic ones', async t => {
+  for (const status of [403, 429]) {
+    const h = harness(t, {holdAnswers:true}); enableVoice(h); await h.start('call', false);
+    h.connection('remote').transcript('Explain closures.');
+    h.connection('you').transcript('Give me a minute to think.'); await settle();
+    await h.tick(3100);
+    h.connection('remote').transcript('Explain binary search.');
+    h.connection('you').transcript('Give me a minute to think.'); await settle();
+    assert.equal(h.state().answerQueue.length, 1);
+    h.requests[0].fail(Object.assign(new Error('Provider denied request'), {status})); await settle();
+    assert.equal(h.requests.length, 1, `Status ${status} must not drain more requests against the same failing provider`);
+    assert.equal(h.state().answerQueue.length, 0); assert.equal(h.state().settings.autoAnswer, false);
+  }
+});
+
+test('council: a spoken short followup inherits the manually typed first question', async t => {
+  const h = harness(t); await h.start('practice', true);
+  await h.invoke('answer:ask', {question:'Design a least recently used cache.'}); await settle();
+  h.connection('you').transcript('Time complexity.'); await h.tick(1000);
+  assert.equal(h.requests.length, 2); assert.equal(h.requests[1].options.question, 'Time complexity.');
+  assert.match(h.requests[1].options.transcript, /Design a least recently used cache/);
+});
+
+test('council: a microphone reconnect drops command prefixes without discarding valid remote question text', async t => {
+  const h = harness(t); enableVoice(h); await h.start('call', false);
+  h.connection('remote').transcript('Explain closures.'); await h.tick(900);
+  const mic = h.connection('you'); mic.transcript('Give me a minute', {start:0,duration:1});
+  mic.options.onState('reconnecting'); mic.transcript('to think.', {start:2,duration:1}); await settle();
+  assert.equal(h.requests.length, 0, 'A command cannot be assembled across a lost audio interval');
+  mic.transcript('Give me a minute to think.', {start:4,duration:1}); await settle();
+  assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.question, 'Explain closures.');
+});
+
+test('council: remote pause phrases are not technical tasks when automatic answers are on', async t => {
+  const h = harness(t); await h.start('call', true);
+  for (const text of ['Give me a minute to think.', 'Gimme a minute to think.', 'Let me think through this for a moment.',
+    'Let me work through this step by step.', 'Ek minute, mujhe sochne dijiye.', 'एक मिनट, मुझे सोचने दीजिए।']) {
+    h.connection('remote').transcript(text); await h.tick(1000);
+  }
+  assert.equal(h.requests.length, 0); assert.equal(h.state().pending.canRecover, false);
+  h.connection('remote').transcript('Give me an example of closures.'); await h.tick(1000);
+  assert.equal(h.requests.length, 1);
+});
+
+test('queued followup binds its accepted question context instead of later unrelated transcript', async t => {
+  const h = harness(t, {holdAnswers:true}); await h.start('practice');
+  const mic = h.connection('you');
+  mic.transcript('Find the longest subarray whose sum is K.'); await h.tick(800);
+  mic.transcript('Time complexity.'); await h.tick(800);
+  mic.transcript('New question: Design a distributed rate limiter.'); await h.tick(800);
+  h.requests[0].finish(); await settle();
+  assert.equal(h.requests[1].options.question, 'Time complexity.');
+  assert.match(h.requests[1].options.transcript, /longest subarray/);
+  assert.doesNotMatch(h.requests[1].options.transcript, /distributed rate limiter/);
+  h.requests[1].finish(); await settle(); assert.equal(h.requests.length, 3);
+  h.requests[2].finish(); await settle();
+});
+
+for (const pause of [300,800,1400,2000,4000]) {
+  test(`DSA background, negative constraints and objective survive ${pause}ms pauses`, async t => {
+    const h = harness(t); await h.start('practice'); const mic = h.connection('you');
+    mic.transcript('You are given an integer array.'); await h.tick(pause);
+    mic.transcript('It can contain negative numbers and zeros.'); await h.tick(pause);
+    assert.equal(h.requests.length, 0);
+    mic.transcript('Return the length of the longest contiguous subarray whose sum is K.'); await h.tick(801);
+    assert.equal(h.requests.length, 1);
+    assert.match(h.requests[0].options.question, /given an integer array.*negative numbers.*Return the length/);
+  });
+  test(`voice command split over ${pause}ms does not leak its prefix into the question`, async t => {
+    const h = harness(t); enableVoice(h); await h.start('practice', false); const mic = h.connection('you');
+    mic.transcript('Explain closures.'); mic.transcript('Give me a minute'); await h.tick(pause);
+    assert.equal(h.requests.length, 0);
+    mic.transcript('to think.'); await settle();
+    assert.equal(h.requests.length, 1); assert.equal(h.requests[0].options.question, 'Explain closures.');
+  });
+}
+
+test('a ninety-second segmented DSA problem retains early constraints without early generation', async t => {
+  const h = harness(t); await h.start('practice'); const mic = h.connection('you');
+  mic.transcript('You are given an integer array with negative numbers and zeros.'); await h.tick(2000);
+  for (let i=0; i<44; i++) { mic.transcript(`Additional bound number ${i+1} is part of the same input specification.`); await h.tick(2000); }
+  assert.equal(h.requests.length, 0);
+  mic.transcript('Return the length of the longest contiguous subarray whose sum is K.'); await h.tick(801);
+  assert.equal(h.requests.length, 1); assert.match(h.requests[0].options.question, /negative numbers and zeros/);
 });
