@@ -65,6 +65,8 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
     appEvents.get('before-quit')?.();
     for (const target of windows) target.destroy();
   };
+  let profileDisk = savedConfig ? JSON.stringify(savedConfig) : null;
+  const profileTemps = new Map();
   const mocks = {
     electron: {
       app: { getPath: () => path.join(__dirname, 'mock-user-data'), setPath() {}, setName() {}, whenReady: () => ({ then: () => ({ catch() {} }) }), on: (name, callback) => appEvents.set(name, callback), quit },
@@ -101,9 +103,16 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
       transcript(text, extra = {}) { this.options.onTranscript({ source: this.options.source, text, isFinal: true, speechFinal: true, ...extra }); }
     } },
     './turns.cjs': require('./turns.cjs'),
+    './profile.cjs': require('./profile.cjs'),
     './routing.cjs': require('./routing.cjs'),
     './oauth.cjs': oauth,
-    'node:fs': { mkdirSync() {}, writeFileSync: (_, content) => writes.push(JSON.parse(content)), renameSync() {}, readFileSync() { if (!savedConfig) throw new Error('No mock configuration.'); return JSON.stringify(savedConfig); } },
+    'node:fs': {
+      existsSync: () => false, mkdirSync() {},
+      readFileSync() { if (profileDisk === null) throw Object.assign(new Error('Missing fixture'), {code:'ENOENT'}); return profileDisk; },
+      writeFileSync(file, content) { profileTemps.set(file, content); writes.push(JSON.parse(content)); },
+      renameSync(file) { profileDisk = profileTemps.get(file); profileTemps.delete(file); },
+      unlinkSync(file) { profileTemps.delete(file); }
+    },
     'node:crypto': require('node:crypto'), 'node:path': path, 'node:url': require('node:url'),
   };
   const context = vm.createContext({
@@ -114,7 +123,7 @@ function harness(t, { credentials = true, holdAnswers = false, oauth = {}, fetch
     fetch: (url, options) => { fetches.push({ url, options }); if (!fetchImpl) throw new Error('Unexpected network request.'); return fetchImpl(url, options); },
   });
   vm.runInContext(source + `
-    win = windowForTest; registerIPC();
+    readConfig(); win = windowForTest; registerIPC();
     globalThis.probe = {
       initialize(hasAnswerKey) { secrets.deepgram = 'fake-speech-key'; secrets.openai = hasAnswerKey ? 'fake-answer-key' : ''; settings.answerProvider = 'openai'; },
       state() { return { live, sessionId, captureAllowed, activeSessionMode, questionSource, autoCount, answers,

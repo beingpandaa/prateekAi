@@ -1,22 +1,35 @@
 {
-  "name": "prateekAi",
+  "name": "prateekai",
+  "productName": "prateekAi",
   "version": "0.5.0",
   "private": true,
   "description": "Windows technical conversation assistant",
   "main": "main.cjs",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beingpandaa/prateekAi.git"
+  },
   "scripts": {
     "start": "electron .",
     "test": "node --test *.test.cjs",
     "smoke": "electron . --smoke-test",
     "test:ui": "electron ui-tests/run.cjs",
     "test:flow": "electron flow-tests/run.cjs",
-    "test:content": "electron content-tests/run.cjs"
+    "test:content": "electron content-tests/run.cjs",
+    "test:profile-compat": "node scripts/profile-compat-smoke.cjs",
+    "build:icon": "node scripts/build-icon.cjs",
+    "package:portable": "node package-portable.cjs"
   },
   "dependencies": {
     "jose": "6.2.12",
     "ws": "8.22.0"
   },
   "devDependencies": {
-    "electron": "44.5.1"
+    "electron": "44.5.1",
+    "resedit": "3.1.0"
   }
 }

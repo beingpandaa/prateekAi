@@ -6,12 +6,14 @@ const { pathToFileURL } = require('node:url');
 const { streamProviderAnswer, listProviderModels, validateBaseUrl } = require('./provider-adapters.cjs');
 const { SpeechSession } = require('./speech.cjs');
 const { TurnAssembler, looksLikeQuestion } = require('./turns.cjs');
+const { resolveProfileDirectory, createProfileStore } = require('./profile.cjs');
 const { selectRoute } = require('./routing.cjs');
 const { beginSignIn, refreshProfile, listModels, revokeProfile } = require('./oauth.cjs');
 
 const smoke = process.argv.includes('--smoke-test');
 const captureTest = process.argv.includes('--capture-test');
-const dataDir = process.env.PRATEEKAI_DATA_DIR || path.join(app.getPath('appData'), 'prateekAi');
+const dataDir = resolveProfileDirectory({ appData: app.getPath('appData'), env: process.env, fileSystem: fs });
+fs.mkdirSync(dataDir, { recursive: true });
 app.setPath('userData', dataDir);
 app.setName('prateekAi');
 const pageURL = pathToFileURL(path.join(__dirname, 'index.html')).href;
@@ -40,7 +42,9 @@ let shutdown = false, captureAllowed = false;
 let workspaceBounds;
 let eventSequence = 0, contentVisibilityGeneration = 0, hotkeyAnswerPending = false, answerSnapshot = { id: null, question: '', text: '', state: 'idle' }, pendingQuestion = '';
 let sourceStates = { remote: 'off', you: 'off' };
-const configPath = path.join(dataDir, 'settings.json');
+const profileStore = createProfileStore({ directory: dataDir, safeStorage, fileSystem: fs });
+let profileError = '';
+const configPath = profileStore.configPath;
 function send(type, detail = {}) {
   const event = { ...detail, type, seq: ++eventSequence };
   if (type === 'session-reset') {
@@ -88,18 +92,14 @@ function safeError(error) {
   return text.replace(/sk-[\w-]+/g, '[redacted]').slice(0, 350);
 }
 function readConfig() {
-  let savedSettings = {};
-  try {
-    const saved = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    savedSettings = saved.settings && typeof saved.settings === 'object' ? saved.settings : {};
-    Object.assign(settings, savedSettings);
-    delete settings.siebelVocabulary; // Discard the removed paid option in older saved setups.
-    if (typeof saved.hostId === 'string' && /^urn:uuid:[0-9a-f-]{36}$/i.test(saved.hostId)) hostId = saved.hostId;
-    if (safeStorage.isEncryptionAvailable()) for (const name of Object.keys(secrets)) {
-      if (saved.keys?.[name]) secrets[name] = safeStorage.decryptString(Buffer.from(saved.keys[name], 'base64'));
-    }
-    if (saved.chatgpt && safeStorage.isEncryptionAvailable()) chatgptProfile = JSON.parse(safeStorage.decryptString(Buffer.from(saved.chatgpt, 'base64')));
-  } catch { /* First run or an unreadable previous configuration. */ }
+  const loaded = profileStore.load();
+  const savedSettings = loaded.settings;
+  profileError = loaded.message;
+  Object.assign(settings, savedSettings);
+  delete settings.siebelVocabulary;
+  secrets = loaded.secrets;
+  chatgptProfile = loaded.chatgptProfile;
+  if (typeof loaded.hostId === 'string' && /^urn:uuid:[0-9a-f-]{36}$/i.test(loaded.hostId)) hostId = loaded.hostId;
   settings.answerProvider = answerProviders.has(savedSettings.answerProvider) ? savedSettings.answerProvider : chatgptProfile?.can_call_api ? 'chatgpt' : secrets.openai ? 'openai' : 'chatgpt';
   settings.providerModels = Object.fromEntries([...answerProviders].map(provider => [provider,
     validModel(savedSettings.providerModels?.[provider]) ? savedSettings.providerModels[provider] : defaultProviderModels[provider]]));
@@ -125,18 +125,10 @@ function readConfig() {
   settings.incompletePauseMs = Math.max(Math.ceil(settings.questionPauseMs / 500) * 500, settings.incompletePauseMs);
 }
 function saveConfig() {
-  const keys = {};
-  if (safeStorage.isEncryptionAvailable()) for (const name of Object.keys(secrets)) {
-    if (secrets[name]) keys[name] = safeStorage.encryptString(secrets[name]).toString('base64');
-  }
-  fs.mkdirSync(dataDir, { recursive: true });
-  const temporary = configPath + '.tmp';
-  const chatgpt = chatgptProfile && safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(JSON.stringify(chatgptProfile)).toString('base64') : null;
-  fs.writeFileSync(temporary, JSON.stringify({ settings, keys, hostId, chatgpt }), 'utf8');
-  fs.renameSync(temporary, configPath);
+  profileStore.save({ settings, secrets, chatgptProfile, hostId });
 }
 function publicSettings() {
-  return { ...settings, providerModels: { ...settings.providerModels }, providerFastModels: { ...settings.providerFastModels },
+  return { ...settings, profileError, providerModels: { ...settings.providerModels }, providerFastModels: { ...settings.providerFastModels },
     hasOpenAI: !!secrets.openai, hasAnthropic: !!secrets.anthropic, hasGemini: !!secrets.gemini, hasCompatible: !!secrets.compatible, hasDeepgram: !!secrets.deepgram,
     hasAnswerProvider: !!credentialIdentity(),
     chatgptConnected: !!chatgptProfile, chatgptCanCall: !!chatgptProfile?.can_call_api, chatgptLabel: chatgptProfile?.accountLabel || '',
@@ -516,6 +508,7 @@ function registerIPC() {
     return focus;
   });
   handle('settings:save', value => {
+    if (!profileStore.canSave) throw new Error(profileError || 'Profile is read-only. Restart after restoring the saved configuration.');
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid settings.');
     if (live) throw new Error('Stop listening before changing setup.');
     // Validate all provider fields before touching either settings or secrets.
@@ -711,6 +704,7 @@ async function createWindow() {
     } catch { callback({}); }
   });
   await win.loadURL(pageURL);
+  if (profileError) send('notice', { message: profileError });
   if (!smoke) win.show();
   if (process.argv.includes('--connect-chatgpt')) await win.webContents.executeJavaScript("document.getElementById('chatgptConnect')?.click()");
   win.on('closed', () => {
@@ -738,7 +732,7 @@ async function createWindow() {
     if (target.isVisible()) target.hide(); else target.showInactive();
   });
   if (smoke) {
-    const out = process.env.PRATEEKAI_TEST_OUT || path.join(__dirname, 'test-output');
+    const out = process.env.PRATEEKAI_TEST_OUT || process.env.CALLSIDE_TEST_OUT || path.join(__dirname, 'test-output');
     fs.mkdirSync(out, { recursive: true });
     win.showInactive();
     await new Promise(resolve => setTimeout(resolve, 900));
@@ -760,7 +754,7 @@ async function createWindow() {
     app.exit(result.ok ? 0 : 1);
   }
   if (captureTest) {
-    const out = process.env.PRATEEKAI_TEST_OUT || path.join(__dirname, 'test-output');
+    const out = process.env.PRATEEKAI_TEST_OUT || process.env.CALLSIDE_TEST_OUT || path.join(__dirname, 'test-output');
     fs.mkdirSync(out, { recursive: true });
     captureAllowed = true;
     await win.webContents.executeJavaScript('window.installCaptureTestMarker()');
